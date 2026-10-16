@@ -121,8 +121,15 @@ prompt: |
   currently supported version as in use and set installed_version to "unknown":
   {{ range .Text }}- {{ . }}
   {{ end }}{{ end }}
-  Use mcp__inventory__results_recent to skip findings already reported in earlier runs unless new information appeared.
+  Start with mcp__inventory__results_recent (limit 20). Each earlier result has findings (reported) and
+  checked (advisories and news items that an earlier run already evaluated, with the verdict). Skip an item
+  whose URL is in an earlier checked list or finding, unless the source shows an update after that run
+  finished; then check it again. Do not report a finding again unless new information appeared.
   Set previously_reported to true when the finding was in an earlier result and you report it again because of new information.
+  In checked, list every advisory or news item that you evaluated in this run, reported or dropped, with
+  its URL, the product it concerns, and a short verdict (for example "reported", "version not affected",
+  "medium severity", "product not in inventory"). Do not repeat items that you skipped because an earlier
+  run checked them.
   For each finding fill title (one line, what the flaw is), cvss (base score, null when none is published),
   exploited (true only when a source reports exploitation in the wild), affected (which products, models or
   configurations are affected and which are not), action (what an operator should check or do, with the
@@ -133,11 +140,24 @@ prompt: |
 appendSystemPrompt: |
   Do not speculate. Every finding needs at least one source URL. Confidence is 0..1.
 
+# checked is the memory of the task: the next run reads it through
+# results_recent and skips what was already evaluated. Sinks show findings only.
 outputSchema:
   type: object
-  required: [findings]
+  required: [findings, checked]
   additionalProperties: false
   properties:
+    checked:
+      type: array
+      maxItems: 60
+      items:
+        type: object
+        required: [url, product, verdict]
+        additionalProperties: false
+        properties:
+          url: { type: string }
+          product: { type: string, maxLength: 120 }
+          verdict: { type: string, maxLength: 160 }
     findings:
       type: array
       items:

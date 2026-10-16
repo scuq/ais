@@ -3,6 +3,12 @@
 All notable changes to this project are in this file.
 The format follows Keep a Changelog.
 
+## [0.3.1] - 2026-10-17
+
+### Changed
+
+- The template `vuln-watch` requires the field `checked` in each result: the advisories and news items that the run evaluated, with `url`, `product`, and `verdict`. The next run reads them through `results_recent` and skips an item that an earlier run checked, unless the source was updated. This saves turns. To use it in an existing task, copy the `checked` part of the prompt and of `outputSchema` from the template, or install the template again with `ais templates use vuln-watch --force`. A task file that you do not change keeps working as before.
+
 ## [0.3.0] - 2026-10-17
 
 ### Added

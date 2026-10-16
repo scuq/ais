@@ -14,6 +14,13 @@ usage, interest, and comments; it never sees a hostname or an address. Findings 
 against a JSON schema, joined back to the devices on the host, and delivered
 to the sinks listed under `sinks:`.
 
+Memory: each result has a list `checked` with the advisories and news items
+that the run evaluated, with the URL, the product, and a short verdict. The
+next run reads the last 20 results through `results_recent` and skips an item
+that an earlier run checked, unless the source was updated after that run.
+This saves the turns that a new check of the same item costs. The sinks show
+only `findings`.
+
 Schedule: `7 7,10-18,20,22 * * *`. The task runs at minute 7: once at 07, at
 each hour from 10 to 18, and at 20 and 22. It does not run in the night. Most
 advisories are published between 09 and 18. The prompt looks back 24 hours, so
