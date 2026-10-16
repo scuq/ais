@@ -1,0 +1,6 @@
+hostname,ip,site,vendor,product,version,comment,owner_email
+fw01.cyberdyne.systems,10.1.0.1,earth,Palo Alto Networks,PAN-OS,11.1.4,"internet exposed, mgmt interface firewall protected",netops@cyberdyne.systems
+fw02.cyberdyne.systems,10.2.0.1,mars,Palo Alto Networks,PAN-OS,11.1.4,"internet exposed, mgmt via jump01.cyberdyne.systems",netops@cyberdyne.systems
+vpn01.cyberdyne.systems,10.1.0.5,earth,Fortinet,FortiOS,7.4.5,"internet exposed, auth using saml",netops@cyberdyne.systems
+sw-core-01.cyberdyne.systems,192.168.10.10,venus,Cisco,IOS XE,17.9.5,"internal only, not using saml",netops@cyberdyne.systems
+app01.cyberdyne.systems,172.16.1.20,earth,Microsoft,Windows Server,2022,"internal only, auth using saml",winops@cyberdyne.systems

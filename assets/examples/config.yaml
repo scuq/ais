@@ -1,0 +1,46 @@
+# Example ~/.config/ais/config.yaml. Every key is optional; these are the
+# ones most installations set.
+version: 1
+runtime:
+  engine: auto          # auto | docker | podman
+egress:
+  mode: proxy           # open only for the first bring-up
+# Redaction policy. Nothing runs until 'aisctl redact approve' records its
+# hash here; any later change reopens the gate.
+pii:
+  domains: [".cyberdyne.systems"]
+  cidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fe80::/10", "fc00::/7"]
+  literals: []
+  hostnameMode: rot13      # rot13 | token
+  ipMode: cgnat            # cgnat (100.64.0.0/10) | token
+  approvedHash: ""
+inventory:
+  file: ~/.config/ais/inventory.csv
+sinks:
+  webex:
+    type: webex
+    url: https://webexapis.com/v1/webhooks/incoming/XXXXXXXX   # Webex App Hub "Incoming Webhooks"
+    maxItems: 10
+    card: false              # true adds an Adaptive Card to the markdown message
+    # Bot mode instead of an incoming webhook:
+    # url: https://webexapis.com/v1/messages
+    # tokenSecret: webex-bot-token     # ais secret set webex-bot-token
+    # roomId: Y2lzY29zcGFyazovL3VzL1JPT00v...
+  ops-webhook:
+    type: webhook
+    url: https://hooks.example/ais
+    headers: { X-Token: "${secret:ops-webhook-token}" }
+  nats:
+    type: nats
+    url: nats://nats.example:4222
+    subject: "ais.results.{{ .Task }}"
+    stream: { name: AIS, subjects: ["ais.results.>"] }
+  splunk:
+    type: splunk_hec
+    url: https://splunk.example:8088/services/collector
+    tokenSecret: splunk-hec-token
+    sourcetype: ais:vulnerability:notification
+    host: ais-host-1
+    insecureSkipVerify: true
+    split: findings
+alerts: [ops-webhook]

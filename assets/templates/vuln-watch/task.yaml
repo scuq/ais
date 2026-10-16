@@ -1,0 +1,166 @@
+# Template: hourly check of security feeds for vulnerabilities that affect
+# inventoried products. Install with 'ais templates use vuln-watch' and
+# adjust sinks and schedule.
+version: 1
+name: vuln-watch
+description: Hourly check of security feeds for vulnerabilities affecting inventoried products.
+enabled: true
+schedule: "7 * * * *"
+jitter: 3m
+overlap: skip
+timeout: 20m
+model: claude-opus-5-5
+effort: high                  # low | medium | high | xhigh | max
+maxTurns: 40
+maxBudgetUsd: 3.00
+
+# Devices with versions come from the CSV; products you only want watched,
+# without device records, go into the text file, one per line.
+inventory:
+  file: ~/.config/ais/inventory.csv
+  format: csv
+  textFile: ~/.config/ais/inventory.txt
+
+# Field policy. Unknown columns are dropped.
+fields:
+  hostname: pseudonym
+  ip: pseudonym
+  site: pseudonym
+  vendor: clear
+  product: clear
+  version: clear
+  comment: scrub
+  owner_email: drop
+  notes: drop
+
+# What the model sees: distinct (vendor, product, version) tuples with a
+# count, never a device. The MCP server offers only the minimized tools.
+expose:
+  prompt:
+    groupBy: [vendor, product, version]
+    collect: [comment]
+  mcp:
+    tools: [inventory_products, results_recent]
+
+tools: [WebFetch, WebSearch]
+allowedTools: [WebFetch, WebSearch, "mcp__inventory__*"]
+
+# WebFetch runs inside the container, so every feed host must be listed.
+# WebSearch is server-side and needs nothing here. A leading dot allows the
+# domain and every subdomain (squid dstdomain). Redirects to CDNs show up in
+# 'ais egress denied'; add them here when a source needs one.
+egress:
+  allow:
+    # primary monitored sources
+    - .thehackernews.com
+    - feeds.feedburner.com          # The Hacker News RSS
+    - .cert.at
+    - .heise.de
+    # exploitation and vulnerability catalogues
+    - .cisa.gov                     # Known Exploited Vulnerabilities
+    - .cert.europa.eu               # CERT-EU
+    - .infosecurity-magazine.com
+    - .nvd.nist.gov                 # CVE details for verification
+    - .reddit.com                   # r/cybersecurity and r/netsec RSS (/.rss)
+    # vendor advisories used for verification
+    - .cisco.com                    # sec.cloudapps.cisco.com and docs
+    - .citrix.com                   # Citrix / NetScaler security bulletins
+    - .netscaler.com
+    - security.paloaltonetworks.com
+    - .f5.com                       # my.f5.com
+    - .keycloak.org                 # Keycloak security releases
+    - .github.com                   # GitHub Security Advisories, Keycloak project
+    - msrc.microsoft.com
+    - fortiguard.fortinet.com
+    # security research blogs
+    - labs.watchtowr.com            # watchTowr Labs
+    - .rapid7.com                   # Rapid7
+    - unit42.paloaltonetworks.com   # Palo Alto Unit 42
+    - .horizon3.ai                  # Horizon3.ai / NodeZero Research
+    - .assetnote.io                 # Assetnote Research
+    - .talosintelligence.com        # Cisco Talos
+    - .tenable.com                  # Tenable Research
+    - blog.qualys.com               # Qualys Threat Research Unit
+    - cloud.google.com              # Mandiant / Google Threat Intelligence blog
+    - .greynoise.io                 # GreyNoise
+    - .vulncheck.com                # VulnCheck
+    - .bishopfox.com                # Bishop Fox
+    - .projectdiscovery.io          # ProjectDiscovery Research
+    - .arcticwolf.com               # Arctic Wolf Labs
+    - news.sophos.com               # Sophos X-Ops
+
+# Extra redaction on top of the global pii policy (config.yaml), if any.
+pii:
+  redact:
+    literals: []
+
+prompt: |
+  You are a vulnerability analyst. Today is {{ .Now.Format "2006-01-02" }} (run {{ .Run.ID }}).
+  Check these sources for vulnerabilities, zero-days and critical advisories published in the last 24 hours.
+  Primary: The Hacker News (thehackernews.com, RSS at feeds.feedburner.com/TheHackersNews), CERT.at (cert.at),
+  heise Security (heise.de/security). Catalogues: CISA Known Exploited Vulnerabilities (cisa.gov), CERT-EU (cert.europa.eu),
+  Infosecurity Magazine, the r/cybersecurity and r/netsec feeds (reddit.com/r/<name>/.rss), GitHub Security Advisories.
+  Verify against the vendor advisories: Cisco (sec.cloudapps.cisco.com), Citrix/NetScaler, Palo Alto Networks
+  (security.paloaltonetworks.com), F5 (my.f5.com), Keycloak (keycloak.org and the project's GitHub advisories), and NVD for CVE details.
+  Only report findings that affect one of these inventoried products; version ranges matter.
+  Only report findings with severity critical or high. Drop medium and low findings; do not raise
+  the severity of a finding to fit. Rate a vulnerability that is exploited in the wild as critical.
+  When an advisory lists indicator-of-compromise IPs or URLs, put them in the summary, so that an
+  operator can block them.
+  {{ range .Groups }}- {{ .Fields.vendor }} {{ .Fields.product }} {{ .Fields.version }} ({{ .Count }} installs){{ with index .Collected "comment" }}; notes: {{ join . "; " }}{{ end }}
+  {{ end }}{{ if .Text }}Free-text product list, without device records. Where a line gives no version, treat every
+  currently supported version as in use and set installed_version to "unknown":
+  {{ range .Text }}- {{ . }}
+  {{ end }}{{ end }}
+  Use mcp__inventory__results_recent to skip findings already reported in earlier runs unless new information appeared.
+  Set previously_reported to true when the finding was in an earlier result and you report it again because of new information.
+  For each finding fill title (one line, what the flaw is), cvss (base score, null when none is published),
+  exploited (true only when a source reports exploitation in the wild), affected (which products, models or
+  configurations are affected and which are not), action (what an operator should check or do, with the
+  exact command or setting where the advisory gives one), and published (publication date, and the date of
+  the last update when the advisory has one).
+  Return an empty findings list when nothing relevant was published.
+
+appendSystemPrompt: |
+  Do not speculate. Every finding needs at least one source URL. Confidence is 0..1.
+
+outputSchema:
+  type: object
+  required: [findings]
+  additionalProperties: false
+  properties:
+    findings:
+      type: array
+      items:
+        type: object
+        required: [product, title, affected_version_range, installed_version, cve_ids, severity, cvss, exploited,
+                   source_urls, summary, affected, action, published, previously_reported, confidence]
+        additionalProperties: false
+        properties:
+          vendor: { type: string }
+          product: { type: string }
+          title: { type: string, maxLength: 120 }
+          affected_version_range: { type: string }
+          installed_version: { type: string }
+          fixed_version: { type: [string, "null"] }
+          cve_ids:
+            type: array
+            items: { type: string, pattern: "^CVE-[0-9]{4}-[0-9]{4,}$" }
+          severity: { type: string, enum: [critical, high] }
+          cvss: { type: [number, "null"], minimum: 0, maximum: 10 }
+          exploited: { type: boolean }
+          source_urls: { type: array, minItems: 1, items: { type: string } }
+          summary: { type: string, maxLength: 1200 }
+          affected: { type: string, maxLength: 600 }
+          action: { type: string, maxLength: 600 }
+          published: { type: string, maxLength: 120 }
+          previously_reported: { type: boolean }
+          confidence: { type: number, minimum: 0, maximum: 1 }
+
+# Host-side join after the run: attach device identity the model never saw.
+enrich:
+  - path: findings
+    match: { product: product, installed_version: version }
+    attach: { devices: [hostname, ip, site] }
+
+sinks: []

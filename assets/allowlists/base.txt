@@ -1,0 +1,2 @@
+# Domains every run may reach regardless of task. One per line; a leading
+# dot matches subdomains (squid dstdomain semantics).

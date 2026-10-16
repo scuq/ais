@@ -1,0 +1,70 @@
+# ais run image. Built by `ais image build` from the embedded recipe. Every
+# non-obvious line carries the reason it exists. This image runs one
+# headless Claude Code invocation and exits; it is not a dev environment.
+FROM docker.io/library/node:22-bookworm-slim
+
+# Pinned: `ais image build` checks that this version advertises every flag
+# ais relies on, so a silent upgrade cannot change the contract.
+ARG CLAUDE_VERSION=2.1.301
+
+# ca-certificates for TLS, jq for the entrypoint's argv file, tini so SIGTERM
+# from `stop` reaches claude and zombies are reaped. No git, no python, no
+# sudo: there is nothing to edit and nothing to install.
+# Acquire::Check-Date=false: apt otherwise refuses Release files dated after
+# the build host's clock ("not valid yet"), which a host with a slow clock
+# hits on every build. Signatures are still verified; only the freshness
+# comparison against the local clock is skipped.
+RUN apt-get -o Acquire::Check-Date=false update \
+    && apt-get -o Acquire::Check-Date=false install -y --no-install-recommends \
+        ca-certificates \
+        jq \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Extra CA certificates (a corporate root, a TLS-inspecting proxy). The
+# context directory always exists and is empty unless image.caCertificates
+# is set, which makes this a no-op by default.
+COPY ca-certificates/ /usr/local/share/ca-certificates/ais/
+RUN update-ca-certificates
+
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_VERSION} \
+    && npm cache clean --force
+
+# Strip setuid/setgid everywhere. Inert under no-new-privileges and
+# cap-drop=ALL, but a latent privilege path the moment that posture slips.
+RUN find / -xdev -perm /6000 -type f -exec chmod ug-s {} + 2>/dev/null || true
+
+# The node image ships uid/gid 1000 as "node". Rename it; podman's
+# keep-id maps the host user onto this uid. On docker the process runs as
+# the daemon's own uid instead, which works because every writable path is
+# a tmpfs (mode 1777) or the one rw bind mount the daemon owns.
+RUN groupmod -n ais node && usermod -l ais -d /home/ais -m node
+
+# Mountpoints. All of them are replaced at run time by a tmpfs or a bind
+# mount; they exist so a read-only rootfs has somewhere to mount onto.
+RUN mkdir -p /run/ais/in /run/ais/out /run/ais/cfg /run/ais/home /run/ais/work /run/ais/bin \
+    && chown -R ais:ais /run/ais
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh
+
+# HOME and CLAUDE_CONFIG_DIR point at tmpfs: nothing a run writes survives
+# it. The DISABLE_* variables keep a pinned image from updating itself,
+# phoning home or reporting; the runtime sets them too, this is the default
+# for anyone running the image by hand.
+ENV HOME=/run/ais/home/ais \
+    CLAUDE_CONFIG_DIR=/run/ais/cfg/claude \
+    LC_ALL=C.UTF-8 \
+    LANG=C.UTF-8 \
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+    DISABLE_UPDATES=1 \
+    DISABLE_AUTOUPDATER=1 \
+    DISABLE_TELEMETRY=1 \
+    DISABLE_ERROR_REPORTING=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+USER ais
+WORKDIR /run/ais/work
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+CMD []

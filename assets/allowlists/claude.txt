@@ -1,0 +1,5 @@
+# What a headless Claude Code run needs. WebSearch is server-side, so the
+# search itself goes through api.anthropic.com.
+api.anthropic.com
+platform.claude.com
+claude.ai

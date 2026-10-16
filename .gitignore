@@ -1,0 +1,34 @@
+# The built binary (use `make build`) and release artefacts.
+/ais
+/aisctl
+/dist/
+
+# Go test and coverage output.
+*.test
+*.out
+coverage.*
+
+# Local runtime state, in case a config points into the work tree.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.passphrase
+/secrets/
+/runs/
+/inventory.csv
+/inventory.txt
+/config.yaml
+
+# Editors and OS files.
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Local Claude Code settings (per-machine permission grants).
+.claude/settings.local.json
+
+# The aibox reference copy is not part of ais.
+/temp/

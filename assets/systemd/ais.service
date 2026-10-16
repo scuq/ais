@@ -1,0 +1,29 @@
+# ais daemon, systemd user unit. Rendered by `aisctl init`; a hand install
+# replaces {{ .ExecStart }} with the path of the ais binary:
+#
+#   install -D -m 0644 ais.service ~/.config/systemd/user/ais.service
+#   systemctl --user daemon-reload && systemctl --user enable --now ais
+#   loginctl enable-linger $USER      # keep it running without a login session
+#
+# The OAuth token can also come from a systemd credential: uncomment
+# LoadCredential and ais reads $CREDENTIALS_DIRECTORY/claude-oauth-token first.
+[Unit]
+Description=ais AI scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={{ .ExecStart }} daemon
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=90
+Environment=AIS_LOG_FORMAT=json
+{{- range .Environment }}
+Environment={{ . }}
+{{- end }}
+#LoadCredential=claude-oauth-token:%h/.config/ais/secrets/claude-oauth-token
+
+[Install]
+WantedBy=default.target

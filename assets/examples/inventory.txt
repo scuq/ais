@@ -1,0 +1,6 @@
+# Free-text inventory: products to watch without device records.
+# One product per line. A version is optional. Lines that start with '#'
+# are comments. Replace these examples with yours.
+Palo Alto Networks GlobalProtect
+Keycloak 26.1
+Citrix NetScaler ADC
