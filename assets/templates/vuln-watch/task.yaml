@@ -1,11 +1,15 @@
-# Template: hourly check of security feeds for vulnerabilities that affect
+# Template: check of security feeds for vulnerabilities that affect
 # inventoried products. Install with 'ais templates use vuln-watch' and
 # adjust sinks and schedule.
 version: 1
 name: vuln-watch
-description: Hourly check of security feeds for vulnerabilities affecting inventoried products.
+description: Check of security feeds for vulnerabilities affecting inventoried products, hourly in the publication peak.
 enabled: true
-schedule: "7 * * * *"
+# Dense where advisories are published: once at 07 for the night, hourly
+# 10-18 (the European and US publication peak), at 20 and 22, nothing in the
+# night. The prompt looks back 24 hours, so a gap delays a finding but does
+# not lose it. Times are in scheduler.timezone.
+schedule: "7 7,10-18,20,22 * * *"
 jitter: 3m
 overlap: skip
 timeout: 20m
@@ -14,12 +18,11 @@ effort: high                  # low | medium | high | xhigh | max
 maxTurns: 40
 maxBudgetUsd: 3.00
 
-# Devices with versions come from the CSV; products you only want watched,
-# without device records, go into the text file, one per line.
+# One entry per system (mdj: markdown with a JSON block per system). An entry
+# without hostname and ip is a product you only want watched. The format
+# follows the file extension: .mdj or .md, .csv, .json, .yaml.
 inventory:
-  file: ~/.config/ais/inventory.csv
-  format: csv
-  textFile: ~/.config/ais/inventory.txt
+  file: ~/.config/ais/inventory.mdj
 
 # Field policy. Unknown columns are dropped.
 fields:
@@ -29,7 +32,9 @@ fields:
   vendor: clear
   product: clear
   version: clear
-  comment: scrub
+  usage: scrub                  # mdj section "## Usage"
+  interest: scrub               # mdj section "## Interest"
+  comment: scrub                # CSV column
   owner_email: drop
   notes: drop
 
@@ -38,7 +43,7 @@ fields:
 expose:
   prompt:
     groupBy: [vendor, product, version]
-    collect: [comment]
+    collect: [usage, interest, comment]
   mcp:
     tools: [inventory_products, results_recent]
 
@@ -105,9 +110,13 @@ prompt: |
   Only report findings that affect one of these inventoried products; version ranges matter.
   Only report findings with severity critical or high. Drop medium and low findings; do not raise
   the severity of a finding to fit. Rate a vulnerability that is exploited in the wild as critical.
+  The usage of a product tells you which features and interfaces are in use; drop a finding that needs
+  a feature the usage rules out. When a product has an interest, report only findings that match it.
+  Where a product gives no version, treat every currently supported version as in use and set
+  installed_version to "unknown".
   When an advisory lists indicator-of-compromise IPs or URLs, put them in the summary, so that an
   operator can block them.
-  {{ range .Groups }}- {{ .Fields.vendor }} {{ .Fields.product }} {{ .Fields.version }} ({{ .Count }} installs){{ with index .Collected "comment" }}; notes: {{ join . "; " }}{{ end }}
+  {{ range .Groups }}- {{ .Fields.vendor }} {{ .Fields.product }} {{ with .Fields.version }}{{ . }}{{ else }}(no version given){{ end }} ({{ .Count }} entries){{ with index .Collected "usage" }}; usage: {{ join . "; " }}{{ end }}{{ with index .Collected "interest" }}; interest: {{ join . "; " }}{{ end }}{{ with index .Collected "comment" }}; notes: {{ join . "; " }}{{ end }}
   {{ end }}{{ if .Text }}Free-text product list, without device records. Where a line gives no version, treat every
   currently supported version as in use and set installed_version to "unknown":
   {{ range .Text }}- {{ . }}

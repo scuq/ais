@@ -112,22 +112,19 @@ type Paths struct {
 	ConfigFile string // ~/.config/ais/config.yaml
 	TasksDir   string
 	UnitFile   string // ~/.config/systemd/user/ais.service
-	Inventory  string // ~/.config/ais/inventory.csv
-	// InventoryText is the free-text inventory, ~/.config/ais/inventory.txt.
-	InventoryText string
+	Inventory  string // ~/.config/ais/inventory.mdj
 }
 
 // UserPaths returns the standard locations under home.
 func UserPaths(home string) Paths {
 	cfg := filepath.Join(home, ".config", "ais")
 	return Paths{
-		Bin:           filepath.Join(home, ".local", "bin", "ais"),
-		ConfigDir:     cfg,
-		ConfigFile:    filepath.Join(cfg, "config.yaml"),
-		TasksDir:      filepath.Join(cfg, "tasks"),
-		UnitFile:      filepath.Join(home, ".config", "systemd", "user", "ais.service"),
-		Inventory:     filepath.Join(cfg, "inventory.csv"),
-		InventoryText: filepath.Join(cfg, "inventory.txt"),
+		Bin:        filepath.Join(home, ".local", "bin", "ais"),
+		ConfigDir:  cfg,
+		ConfigFile: filepath.Join(cfg, "config.yaml"),
+		TasksDir:   filepath.Join(cfg, "tasks"),
+		UnitFile:   filepath.Join(home, ".config", "systemd", "user", "ais.service"),
+		Inventory:  filepath.Join(cfg, "inventory.mdj"),
 	}
 }
 
@@ -149,8 +146,6 @@ type InitOptions struct {
 	// PassphraseFile seeds the secret store passphrase; empty generates one.
 	PassphraseFile string
 	Inventory      string
-	// InventoryText is a free-text inventory to install as inventory.txt.
-	InventoryText string
 	// Templates lists shipped task templates to install (ais templates use).
 	Templates []string
 	Force     bool
@@ -230,28 +225,17 @@ func Init(ctx context.Context, e *Env, o InitOptions) error {
 		}
 		e.logf("installed inventory %s", p.Inventory)
 	} else if !fileExists(p.Inventory) {
-		if err := os.WriteFile(p.Inventory, assets.Read("examples/inventory.csv"), 0o600); err != nil {
+		if err := os.WriteFile(p.Inventory, assets.Read("examples/inventory.mdj"), 0o600); err != nil {
 			return err
 		}
 		e.logf("wrote example inventory %s (replace it with yours)", p.Inventory)
-	}
-	if o.InventoryText != "" {
-		if err := installFile(o.InventoryText, p.InventoryText, 0o600); err != nil {
-			return err
-		}
-		e.logf("installed free-text inventory %s", p.InventoryText)
-	} else if !fileExists(p.InventoryText) {
-		if err := os.WriteFile(p.InventoryText, assets.Read("examples/inventory.txt"), 0o600); err != nil {
-			return err
-		}
-		e.logf("wrote example free-text inventory %s (replace it with yours)", p.InventoryText)
 	}
 	cfg, err := loadConfig(p.ConfigFile)
 	if err != nil {
 		return err
 	}
 	for _, name := range o.Templates {
-		dst, err := templates.Install(name, "", p.TasksDir, p.Inventory, p.InventoryText, taskDefaults(cfg), o.Force)
+		dst, err := templates.Install(name, "", p.TasksDir, p.Inventory, taskDefaults(cfg), o.Force)
 		if errors.Is(err, templates.ErrExists) {
 			e.logf("task %s already exists (kept)", dst)
 			continue
@@ -417,7 +401,7 @@ func RenderConfig(o InitOptions, p Paths) []byte {
 	}
 	fmt.Fprintf(&b, "egress:\n  mode: %s\n", o.Egress)
 	fmt.Fprintf(&b, "scheduler:\n  timezone: %s\n", tz)
-	fmt.Fprintf(&b, "inventory:\n  file: %s\n  textFile: %s\n", p.Inventory, p.InventoryText)
+	fmt.Fprintf(&b, "inventory:\n  file: %s\n", p.Inventory)
 	pol := pseudo.DefaultRedaction()
 	b.WriteString("# Redaction policy. Nothing runs until 'aisctl redact approve' records its\n# hash in approvedHash; any later change here reopens the gate.\n")
 	fmt.Fprintf(&b, "pii:\n  domains: [%s]\n  cidrs: [%s]\n  literals: []\n  hostnameMode: %s      # rot13 | token\n  ipMode: %s            # cgnat (100.64.0.0/10) | token\n  approvedHash: \"\"\n",

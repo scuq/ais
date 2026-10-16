@@ -60,7 +60,7 @@ func testEnv(t *testing.T) (*Env, *fakeHost, *runtime.Fake) {
 	return e, host, fake
 }
 
-func assetsInventory() []byte { return assets.Read("examples/inventory.csv") }
+func assetsInventory() []byte { return assets.Read("examples/inventory.mdj") }
 
 func writeFakeAIS(t *testing.T) string {
 	t.Helper()
@@ -100,7 +100,7 @@ func TestRenderConfigParses(t *testing.T) {
 	if cfg2.Runtime.Image != "ghcr.io/x/ais:1" {
 		t.Errorf("init --image not persisted: %s", cfg2.Runtime.Image)
 	}
-	if cfg.Runtime.Engine != "docker" || cfg.Egress.Mode != "open" || cfg.Scheduler.Timezone != "UTC" || cfg.Image.ClaudeVersion != "2.1.301" || cfg.Inventory.File != "/h/.config/ais/inventory.csv" || cfg.Inventory.TextFile != "/h/.config/ais/inventory.txt" || cfg.Paths.StateDir != "/h/.local/state/ais" || cfg.Secrets.Dir != "/h/.config/ais/secrets" || cfg.Paths.TasksDir != "/h/.config/ais/tasks" {
+	if cfg.Runtime.Engine != "docker" || cfg.Egress.Mode != "open" || cfg.Scheduler.Timezone != "UTC" || cfg.Image.ClaudeVersion != "2.1.301" || cfg.Inventory.File != "/h/.config/ais/inventory.mdj" || cfg.Inventory.TextFile != "" || cfg.Paths.StateDir != "/h/.local/state/ais" || cfg.Secrets.Dir != "/h/.config/ais/secrets" || cfg.Paths.TasksDir != "/h/.config/ais/tasks" {
 		t.Errorf("%+v", cfg)
 	}
 	if len(cfg.Sinks) != 0 {
@@ -135,7 +135,7 @@ func TestInitNoStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := UserPaths(e.Home)
-	for _, f := range []string{p.Bin, p.ConfigFile, p.UnitFile, p.Inventory, p.InventoryText, filepath.Join(p.TasksDir, "vuln-watch.yaml"), filepath.Join(p.ConfigDir, "secrets", "claude-oauth-token")} {
+	for _, f := range []string{p.Bin, p.ConfigFile, p.UnitFile, p.Inventory, filepath.Join(p.TasksDir, "vuln-watch.yaml"), filepath.Join(p.ConfigDir, "secrets", "claude-oauth-token")} {
 		if !fileExists(f) {
 			t.Errorf("missing %s", f)
 		}
@@ -252,7 +252,7 @@ func TestRedactTestAndApproveGate(t *testing.T) {
 		t.Errorf("example inventory must be fully covered: %+v (%d records)", rep.Coverage, rep.Records)
 	}
 	// An uncovered inventory value blocks approval unless forced.
-	_ = os.WriteFile(p.Inventory, []byte("hostname,ip,product,version\nx.other.example,8.8.4.4,P,1\n"), 0o600)
+	_ = os.WriteFile(p.Inventory, []byte("# x\n```json\n{\"hostname\": \"x.other.example\", \"ip\": \"8.8.4.4\", \"product\": \"P\"}\n```\n"), 0o600)
 	if err := RedactApprove(context.Background(), e, RedactApproveOptions{}); err == nil || !strings.Contains(err.Error(), "--force") {
 		t.Errorf("expected refusal, got %v", err)
 	}
@@ -285,10 +285,12 @@ func TestRedactTestInventoryFormats(t *testing.T) {
 	csvPath := filepath.Join(dir, "inv.csv")
 	jsonPath := filepath.Join(dir, "inv.json")
 	yamlPath := filepath.Join(dir, "inv.yaml")
+	mdjPath := filepath.Join(dir, "inv.mdj")
 	_ = os.WriteFile(csvPath, []byte("hostname,ip,product,comment\nfw01.cyberdyne.systems,10.1.0.1,PAN-OS,\"exposed via jump01.cyberdyne.systems, auth using saml\"\n"), 0o600)
 	_ = os.WriteFile(jsonPath, []byte(`[{"hostname":"fw01.cyberdyne.systems","ip":"10.1.0.1","product":"PAN-OS","comment":"exposed via jump01.cyberdyne.systems, auth using saml"}]`), 0o600)
 	_ = os.WriteFile(yamlPath, []byte("- hostname: fw01.cyberdyne.systems\n  ip: 10.1.0.1\n  product: PAN-OS\n  comment: exposed via jump01.cyberdyne.systems, auth using saml\n"), 0o600)
-	for _, path := range []string{csvPath, jsonPath, yamlPath} {
+	_ = os.WriteFile(mdjPath, []byte("# fw01\n\n```json\n{\"hostname\": \"fw01.cyberdyne.systems\", \"ip\": \"10.1.0.1\", \"product\": \"PAN-OS\"}\n```\n\n## Comment\n\nexposed via jump01.cyberdyne.systems, auth using saml\n"), 0o600)
+	for _, path := range []string{csvPath, jsonPath, yamlPath, mdjPath} {
 		rep, err := RunRedactTest(context.Background(), cfg, RedactTestOptions{Inventory: path})
 		if err != nil {
 			t.Fatalf("%s: %v", path, err)

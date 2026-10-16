@@ -32,7 +32,7 @@ type Source interface {
 // SourceConfig selects and configures a source.
 type SourceConfig struct {
 	File   string
-	Format string // yaml | json | csv | auto
+	Format string // yaml | json | csv | mdj | auto
 }
 
 // Open returns the source for a config.
@@ -49,20 +49,22 @@ func Open(cfg SourceConfig) (Source, error) {
 			format = "json"
 		case ".csv":
 			format = "csv"
+		case ".mdj", ".md":
+			format = "mdj"
 		default:
-			return nil, fmt.Errorf("inventory: cannot infer format of %s (set format: yaml|json|csv)", cfg.File)
+			return nil, fmt.Errorf("inventory: cannot infer format of %s (set format: yaml|json|csv|mdj)", cfg.File)
 		}
 	}
 	switch format {
-	case "yaml", "json", "csv":
+	case "yaml", "json", "csv", "mdj":
 	default:
 		return nil, fmt.Errorf("inventory: unknown format %q", format)
 	}
 	return &FileSource{Path: cfg.File, Format: format}, nil
 }
 
-// FileSource reads a flat list of objects (yaml, json) or a CSV with a
-// header row.
+// FileSource reads a flat list of objects (yaml, json), a CSV with a
+// header row, or a markdown file with one JSON block per system (mdj).
 type FileSource struct {
 	Path   string
 	Format string
@@ -84,6 +86,8 @@ func Parse(r io.Reader, format string) ([]Record, error) {
 	switch format {
 	case "csv":
 		return parseCSV(r)
+	case "mdj":
+		return parseMDJ(r)
 	case "json":
 		var rows []map[string]any
 		if err := json.NewDecoder(r).Decode(&rows); err != nil {

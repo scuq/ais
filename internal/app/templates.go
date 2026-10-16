@@ -63,7 +63,7 @@ func cmdTemplates(p *output.Printer, args []string) error {
 		if len(pos) != 1 {
 			return fmt.Errorf("usage: ais templates use <name> [--as NAME] [--force]")
 		}
-		path, err := templates.Install(pos[0], *as, cfg.TasksDir(), config.ExpandPath(cfg.Inventory.File), config.ExpandPath(cfg.Inventory.TextFile), taskDefaults(cfg), *force)
+		path, err := templates.Install(pos[0], *as, cfg.TasksDir(), config.ExpandPath(cfg.Inventory.File), taskDefaults(cfg), *force)
 		if err != nil {
 			return err
 		}

@@ -29,7 +29,7 @@ func TestGenerate(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := string(files[PromptFile])
-	if !strings.Contains(p, "2026-10-13") || !strings.Contains(p, "- V P 1 (2 installs)") || !strings.Contains(p, "- Keycloak 26.1") {
+	if !strings.Contains(p, "2026-10-13") || !strings.Contains(p, "- V P 1 (2 entries)") || !strings.Contains(p, "- Keycloak 26.1") {
 		t.Errorf("prompt: %s", p)
 	}
 	if !strings.Contains(string(files[SystemFile]), "free-text product list") || !strings.Contains(string(files[InventoryFile]), `"Keycloak 26.1"`) {

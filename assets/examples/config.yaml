@@ -15,7 +15,7 @@ pii:
   ipMode: cgnat            # cgnat (100.64.0.0/10) | token
   approvedHash: ""
 inventory:
-  file: ~/.config/ais/inventory.csv
+  file: ~/.config/ais/inventory.mdj
 sinks:
   webex:
     type: webex

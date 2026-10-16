@@ -24,7 +24,7 @@ COMMANDS
                 example task, store the OAuth token, build or pull the run
                 image, pull the sidecar images, bring the network up, install
                 and start the systemd user unit, wait for health
-    redact test [--text T] [--stdin] [--inventory FILE [--format csv|json|yaml]]
+    redact test [--text T] [--stdin] [--inventory FILE [--format mdj|csv|json|yaml]]
                 Show the redaction policy, run samples (and your text) through
                 it, show every inventory record before and after, and list
                 inventory values the policy would miss
@@ -57,9 +57,7 @@ INIT OPTIONS
                                   $CLAUDE_CODE_OAUTH_TOKEN, else a hidden prompt)
     --passphrase-file PATH        passphrase that encrypts the secret store
                                   (default: generated into ~/.config/ais/secrets/.passphrase)
-    --inventory PATH              inventory file to install as ~/.config/ais/inventory.csv
-    --inventory-text PATH         free-text inventory (one product per line) to install
-                                  as ~/.config/ais/inventory.txt
+    --inventory PATH              inventory file (mdj) to install as ~/.config/ais/inventory.mdj
     --template NAME               install a shipped task template (repeatable;
                                   'ais templates list' shows them)
     --force                       re-apply over an existing setup (files are backed up)
@@ -203,7 +201,6 @@ func runInit(ctx context.Context, e *Env, args []string) error {
 	fs.StringVar(&o.TokenFile, "token-file", "", "")
 	fs.StringVar(&o.PassphraseFile, "passphrase-file", "", "")
 	fs.StringVar(&o.Inventory, "inventory", "", "")
-	fs.StringVar(&o.InventoryText, "inventory-text", "", "")
 	fs.Var((*listFlag)(&o.Templates), "template", "")
 	fs.BoolVar(&o.Force, "force", false, "")
 	fs.BoolVar(&o.NoStart, "no-start", false, "")

@@ -73,8 +73,8 @@ func List(d task.Defaults) ([]Info, error) {
 var nameLine = regexp.MustCompile(`(?m)^name:[^\n]*$`)
 
 // Render returns the template's task.yaml with the task name and the
-// inventory paths adjusted. An empty path keeps the template's default.
-func Render(name, asName, inventoryFile, textFile string) ([]byte, error) {
+// inventory path adjusted. An empty path keeps the template's default.
+func Render(name, asName, inventoryFile string) ([]byte, error) {
 	raw, err := TaskYAML(name)
 	if err != nil {
 		return nil, err
@@ -84,10 +84,7 @@ func Render(name, asName, inventoryFile, textFile string) ([]byte, error) {
 		doc = nameLine.ReplaceAllString(doc, "name: "+asName)
 	}
 	if inventoryFile != "" {
-		doc = strings.ReplaceAll(doc, "~/.config/ais/inventory.csv", inventoryFile)
-	}
-	if textFile != "" {
-		doc = strings.ReplaceAll(doc, "~/.config/ais/inventory.txt", textFile)
+		doc = strings.ReplaceAll(doc, "~/.config/ais/inventory.mdj", inventoryFile)
 	}
 	return []byte(doc), nil
 }
@@ -97,11 +94,11 @@ var ErrExists = errors.New("task file exists; pass --force to overwrite")
 
 // Install writes the template into tasksDir as <asName>.yaml and validates
 // the result. Returns the path written.
-func Install(name, asName, tasksDir, inventoryFile, textFile string, d task.Defaults, force bool) (string, error) {
+func Install(name, asName, tasksDir, inventoryFile string, d task.Defaults, force bool) (string, error) {
 	if asName == "" {
 		asName = name
 	}
-	doc, err := Render(name, asName, inventoryFile, textFile)
+	doc, err := Render(name, asName, inventoryFile)
 	if err != nil {
 		return "", err
 	}

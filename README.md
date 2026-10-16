@@ -69,7 +69,7 @@ Run all commands as an unprivileged user. `aisctl` refuses to run as root.
     aisctl init --template vuln-watch
 
     # 4. edit: inventory, task, pii domains and cidrs
-    $EDITOR ~/.config/ais/inventory.csv ~/.config/ais/tasks/vuln-watch.yaml ~/.config/ais/config.yaml
+    $EDITOR ~/.config/ais/inventory.mdj ~/.config/ais/tasks/vuln-watch.yaml ~/.config/ais/config.yaml
 
     # 5. redaction: test until no NOT COVERED, then approve (starts daemon)
     aisctl redact test
@@ -105,7 +105,7 @@ No approval, no runs. Details in the steps below.
 
    1. It checks the container engine and `systemctl --user`.
    2. It installs the ais binary to `~/.local/bin/ais`. If no other ais binary is available, it installs a copy of `aisctl`.
-   3. It writes `~/.config/ais/config.yaml` with explicit paths. It writes an example inventory and an example free-text inventory if none exist.
+   3. It writes `~/.config/ais/config.yaml` with explicit paths. It writes the example inventory `~/.config/ais/inventory.mdj` if none exists.
    4. It installs each task template that you name with `--template`, for example `vuln-watch`. The option can repeat.
    5. It stores the OAuth token as the secret `claude-oauth-token`. The token comes from `--token-file`, from `CLAUDE_CODE_OAUTH_TOKEN`, or from a hidden prompt.
    6. It builds the run image, or pulls the image from `--image`. It also pulls the proxy image and the sidecar image.
@@ -160,7 +160,7 @@ Use these steps if you do not want `aisctl`. You must still approve the redactio
         mkdir -p ~/.config/ais/tasks
         cp assets/examples/config.yaml ~/.config/ais/config.yaml
         ais templates use vuln-watch
-        cp assets/examples/inventory.csv ~/.config/ais/inventory.csv
+        cp assets/examples/inventory.mdj ~/.config/ais/inventory.mdj
 
    Edit the files for your site. The example sinks in `config.yaml` point to placeholder hosts.
    Remove the sinks and the `alerts` key if you have no sink yet.
@@ -311,22 +311,61 @@ The task keys `pii.redact.domains`, `pii.redact.cidrs`, and `pii.redact.literals
 | Key | Default | Meaning |
 |---|---|---|
 | `inventory.file` | empty | Default inventory file. A task can set its own. |
-| `inventory.format` | `auto` | `auto`, `yaml`, `json`, or `csv`. `auto` uses the file extension. |
-| `inventory.textFile` | empty | Free-text inventory. A task can set its own. |
+| `inventory.format` | `auto` | `auto`, `yaml`, `json`, `csv`, or `mdj`. `auto` uses the file extension. The extensions `.mdj` and `.md` give `mdj`. |
+| `inventory.textFile` | empty | Free-text inventory. A task can set its own. The shipped files do not use it. |
 
 An inventory is a flat list of records. A CSV file has a header row. A YAML or JSON file is a list of objects.
 ais reads every value as a string.
-The example inventory `assets/examples/inventory.csv` has a `comment` column. Use the mode `scrub` for such a column.
+The example inventory `assets/examples/inventory.mdj` has a `usage` and an `interest` field. Use the mode `scrub` for such a field.
+
+The format `mdj` (markdown with JSON) is the format for people to write. Each system or product has one level 1 heading, one JSON block, and optional free-text sections:
+
+    # fw01.cyberdyne.systems
+
+    ```json
+    {"hostname": "fw01.cyberdyne.systems", "ip": "10.1.0.1", "site": "earth",
+     "vendor": "Palo Alto Networks", "product": "PAN-OS", "version": "11.1.4"}
+    ```
+
+    ## Usage
+
+    Edge firewall, internet facing. No GlobalProtect VPN.
+
+    ## Interest
+
+    Only critical and high findings with an unauthenticated remote attack vector.
+
+These rules apply to an `mdj` file:
+
+- Text before the first level 1 heading is a preamble. ais ignores it.
+- The JSON block follows the heading directly. Its fence is ```` ``` ```` or `~~~`, and its language is `json` or none.
+- The JSON block holds one JSON object with the definitive values, for example `hostname`, `ip`, `site`, `vendor`, `product`, and `version`.
+  The values are flat: no nested object and no array. A number or a boolean becomes a string.
+- Each level 2 heading starts a free-text field. The name of the field is the heading in lowercase, with each run of characters that are not letters or digits changed to `_`. The heading `Owner Notes` gives `owner_notes`.
+- The text of a field has single spaces. Level 3 and lower headings and code blocks inside a section are part of the text.
+- The text of the level 1 heading is a label. It is not a field.
+- A product without device records has no `hostname` and no `ip`. If it has no `version`, ais watches every supported version.
+
+ais stops with an error and a line number in these cases:
+
+- A system has no JSON block.
+- Prose is between the heading or the JSON block and the first level 2 heading.
+- A level 2 heading is before the JSON block.
+- A second code block is before the first level 2 heading.
+- A JSON value is nested, or the block holds more than one JSON value.
+- The language of a code block is not `json`.
+- A code block is not closed.
+- A section field has the name of a JSON key or of another section.
+- A level 1 heading is empty, or a level 2 heading gives no field name.
 
 The free-text inventory is a text file with one product per line, for example `Palo Alto Networks GlobalProtect` or `Keycloak 26.1`.
 A version is optional. ais ignores blank lines and lines that start with `#`.
 A line has 300 characters at most, and the file has 500 lines at most.
 The model gets each line through the prompt and through `inventory_products`.
-The redactor rewrites a hostname or an address in a line in the same way as a `scrub` column.
-The example file is `assets/examples/inventory.txt`.
 If `inventory.textFile` names a file that does not exist, the run fails. Create the file or remove the key.
+In new setups, use an `mdj` entry without `hostname`, `ip`, and `version` instead.
 
-ais reads the inventory file and the free-text file at the start of each run. A change to these files applies to the next run. A reload or a restart of the daemon is not necessary.
+ais reads the inventory file (and the free-text file, if you set one) at the start of each run. A change to these files applies to the next run. A reload or a restart of the daemon is not necessary.
 If a change adds a hostname or an address outside `pii.domains` or `pii.cidrs`, run `aisctl redact test`. The daemon does not check the coverage of the inventory at the start of a run.
 
 ### delivery
@@ -434,7 +473,7 @@ To change top-level keys without an editor, use `ais tasks set`.
 | `maxBudgetUsd` | `claude.defaultMaxBudgetUsd` | Cost limit of one run. |
 | `inventory.file` | `inventory.file` | Inventory file for this task. |
 | `inventory.format` | `auto` | Format of that file. |
-| `inventory.textFile` | `inventory.textFile` | Free-text inventory for this task. The template `{{ .Text }}` gives its lines. |
+| `inventory.textFile` | `inventory.textFile` | Free-text inventory for this task. The shipped templates do not set it. The template `{{ .Text }}` gives its lines. |
 | `fields` | none | Map from inventory column to `clear`, `pseudonym`, `scrub`, or `drop`. A column that is not listed is dropped. |
 | `expose.prompt.groupBy` | none | List of columns. The prompt gets the distinct combinations of these columns and a count. Each column must be `clear`. |
 | `expose.prompt.collect` | none | List of columns, for example `[comment]`. For each group, the prompt gets the distinct values of these columns, at most 20. Each column must be `clear` or `scrub`. |
@@ -534,7 +573,7 @@ The new field holds a list with one object for each inventory record that matche
 | Command | Meaning |
 |---|---|
 | `aisctl init` | Do the complete setup. See Quickstart. It does not start the daemon until you approve the redaction policy. |
-| `aisctl redact test` | Print the redaction policy and its hash. Run samples through the policy, and list inventory values that it does not cover. `--text T` adds your text. `--stdin` adds text from standard input. `--inventory FILE` uses another inventory, and `--format csv\|json\|yaml` sets its format. `--task NAME` applies the `fields` of that task. Without it, a policy based on the column names applies. `--json` prints the report as JSON. The report shows every record before and after redaction. |
+| `aisctl redact test` | Print the redaction policy and its hash. Run samples through the policy, and list inventory values that it does not cover. `--text T` adds your text. `--stdin` adds text from standard input. `--inventory FILE` uses another inventory, and `--format csv\|json\|yaml\|mdj` sets its format. `--task NAME` applies the `fields` of that task. Without it, a policy based on the column names applies. This policy scrubs fields named `usage` or `interest`, and fields with `descr`, `comment`, `note`, or `remark` in the name. `--json` prints the report as JSON. The report shows every record before and after redaction. |
 | `aisctl redact approve` | Run the test, and write `pii.approvedHash` to `config.yaml`. It stops if inventory values are not covered, unless you give `--force`. Then it starts the unit if the unit is enabled and not running, or sends SIGHUP if the unit is running. The new policy applies to the next run. `--no-start` skips this last step. |
 | `aisctl prompts list` | List the logged prompts from `prompts.ndjson`, newest first, with dry runs. `--task T` and `-n N` limit the list. `aisctl prompts` alone does the same. |
 | `aisctl prompts last` | Show the newest prompt. `--task T` limits it to one task. |
@@ -561,8 +600,7 @@ Options of `aisctl init`:
 | `--ais-binary PATH` | The ais binary to install. Default: a file named `ais` next to `aisctl`, then a file named `ais` on `PATH`, then `aisctl` itself. |
 | `--token-file PATH` | File with the OAuth token. Without it, ais uses `CLAUDE_CODE_OAUTH_TOKEN`, then a hidden prompt. If the secret exists already, `aisctl init` keeps it unless you give this option. |
 | `--passphrase-file PATH` | File with the passphrase for the secret store. Without it, `aisctl init` generates a random passphrase if none exists. |
-| `--inventory PATH` | Install this file as `~/.config/ais/inventory.csv`. |
-| `--inventory-text PATH` | Install this file as `~/.config/ais/inventory.txt`, the free-text inventory. |
+| `--inventory PATH` | Install this file as `~/.config/ais/inventory.mdj`. |
 | `--template NAME` | Install the task template `NAME` into the tasks directory. The option can repeat. `ais templates list` shows the names. |
 | `--force` | Apply the setup again over an existing setup. |
 | `--no-start` | Write everything, and start nothing. |

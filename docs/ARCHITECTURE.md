@@ -8,7 +8,7 @@ The package `internal/runner` does a run from start to end. A scheduled tick and
 
 1. The runner takes an exclusive `flock` on `<runs>/<task>/.lock`. The runner records a run with the state `skipped` and the reason `overlap` in two cases. The first case is a busy lock. The second case is a `queued` or `running` run in the database that started less than twice the task `timeout` ago. The new run stops here.
 2. The runner reads the token from the secret store. The secret name is `claude.oauthTokenSecret`.
-3. `Prepare` creates the run directory with `in/` and `out/` (mode 0700). It loads the inventory and the free-text inventory. For each key, the task value applies when the task sets it, and `inventory` in the configuration otherwise.
+3. `Prepare` creates the run directory with `in/` and `out/` (mode 0700). It loads the inventory and the free-text inventory, if `inventory.textFile` is set. For each key, the task value applies when the task sets it, and `inventory` in the configuration otherwise.
 4. `Prepare` gets the salt of the task from the database and applies the field policy. The tokenizer uses `pii.hostnameMode` and `pii.ipMode`. Each `pseudonym` value becomes a token, and the token map is filled. Columns that are not in `fields` are dropped. Each free-text line goes through the same redactor as a `scrub` column.
 5. If the task sets `expose.prompt.groupBy`, `Prepare` builds the minimized groups from the pseudonymized records.
 6. `Prepare` merges the redaction rules: `pii.domains`, `pii.cidrs`, and `pii.literals` from the configuration, then the `pii.redact` lists of the task. It adds `pii.hostnameMode`, `pii.ipMode`, and a random 32-byte key for the `cgnat` mapping in the hook.
@@ -97,7 +97,7 @@ The capture in `stdout.json` still gets every line. `ParseEnvelope` finds the re
 | `internal/app` | The command line. It parses arguments and calls the other packages. It also holds the daemon loop and the retention loop. |
 | `internal/config` | Defaults, YAML file, environment variables, and validation of the configuration. |
 | `internal/task` | The task schema, defaults, validation, and loading from a directory. |
-| `internal/inventory` | Reads CSV, JSON, and YAML inventories, and the free-text inventory. Builds the minimized groups and gathers the collected values. |
+| `internal/inventory` | Reads CSV, JSON, YAML, and `mdj` inventories, and the free-text inventory. Builds the minimized groups and gathers the collected values. |
 | `internal/templates` | The task templates in the binary: list, show, and install. |
 | `internal/pseudo` | Field policy, tokens, token map, depseudonymization, redactor, and leak check. |
 | `internal/prompt` | Renders the prompt and the other input files. |
@@ -333,7 +333,7 @@ It reuses the packages `config`, `egress`, `image`, `doctor`, `runtime`, `secret
 
 1. Preflight: not root, container engine available, `systemctl --user --version` works. It stops if `config.yaml` or the unit file exists and you did not give `--force`.
 2. Copy the ais binary to `~/.local/bin/ais`. It uses the first of these: the `--ais-binary` path, a file named `ais` next to `aisctl`, a file named `ais` on `PATH`, and `aisctl` itself.
-3. Write `config.yaml` with explicit `paths`, `secrets`, `runtime`, `egress`, `scheduler`, and `inventory` values, and the sink examples as comments. Write the example inventory and the example free-text inventory if none exist. Install each task template that you give with `--template`. Load the result and check it.
+3. Write `config.yaml` with explicit `paths`, `secrets`, `runtime`, `egress`, `scheduler`, and `inventory` values, and the sink examples as comments. Write the example inventory `inventory.mdj` if none exists. Install each task template that you give with `--template`. Load the result and check it.
 4. Store the token. The source order is `--token-file`, `CLAUDE_CODE_OAUTH_TOKEN`, then a hidden prompt.
 5. Build the image, or pull the image from `--image` and check its flags. With `--image`, write `runtime.image` to `config.yaml`. Pull the proxy image and the sidecar image if they are not present.
 6. In `proxy` mode, call `Manager.Ensure`. The backend sidecar starts later, when the daemon creates its sockets.
@@ -359,7 +359,7 @@ In the hook, `token` mode and an IPv6 address give `[redacted]`.
 `Redaction.Check` lists inventory hostnames outside the domains and addresses outside the ranges. `aisctl redact test` uses it. The command shows each record before and after redaction. It uses the `fields` of the task from `--task`, or `GenericPolicy` otherwise. `GenericPolicy` maps columns by name:
 
 - Host-like and address-like columns become `pseudonym`.
-- Columns with `comment`, `note`, or `remark` in the name become `scrub`.
+- Columns named `usage` or `interest`, and columns with `descr`, `comment`, `note`, or `remark` in the name, become `scrub`.
 - Columns with `mail`, `owner`, or `user` in the name become `drop`.
 - All other columns become `clear`.
 
@@ -383,7 +383,7 @@ The file has the fields `run_id`, `task`, `time`, `sha256`, `bytes`, `system`, a
 
 ## Task templates
 
-`assets/templates/<name>/task.yaml` and `README.md` are embedded in the binary. `templates.Install` writes the task file as `<tasksDir>/<name>.yaml`. It replaces the `name:` line when you give `--as`, and replaces the default inventory paths with the configured paths. It then loads the file to check it, and removes the file if the check fails. An existing file gives `ErrExists` unless you force it.
+`assets/templates/<name>/task.yaml` and `README.md` are embedded in the binary. `templates.Install` writes the task file as `<tasksDir>/<name>.yaml`. It replaces the `name:` line when you give `--as`, and replaces the default inventory path with the configured path. It then loads the file to check it, and removes the file if the check fails. An existing file gives `ErrExists` unless you force it.
 
 ## Secret store
 

@@ -44,10 +44,9 @@ func TestEveryTemplateIsValid(t *testing.T) {
 
 func TestInstall(t *testing.T) {
 	dir := t.TempDir()
-	inv := filepath.Join(dir, "inv.csv")
-	_ = os.WriteFile(inv, []byte("product,version\nP,1\n"), 0o600)
-	txt := filepath.Join(dir, "inv.txt")
-	path, err := Install("vuln-watch", "my-watch", filepath.Join(dir, "tasks"), inv, txt, d, false)
+	inv := filepath.Join(dir, "inv.mdj")
+	_ = os.WriteFile(inv, []byte("# P\n```json\n{\"product\": \"P\", \"version\": \"1\"}\n```\n"), 0o600)
+	path, err := Install("vuln-watch", "my-watch", filepath.Join(dir, "tasks"), inv, d, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,16 +54,16 @@ func TestInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tk.Name != "my-watch" || tk.Inventory == nil || tk.Inventory.File != inv || tk.Inventory.TextFile != txt {
+	if tk.Name != "my-watch" || tk.Inventory == nil || tk.Inventory.File != inv || tk.Inventory.TextFile != "" {
 		t.Errorf("%+v", tk)
 	}
-	if _, err := Install("vuln-watch", "my-watch", filepath.Join(dir, "tasks"), inv, txt, d, false); err == nil || !strings.Contains(err.Error(), "--force") {
+	if _, err := Install("vuln-watch", "my-watch", filepath.Join(dir, "tasks"), inv, d, false); err == nil || !strings.Contains(err.Error(), "--force") {
 		t.Errorf("overwrite not refused: %v", err)
 	}
-	if _, err := Install("vuln-watch", "my-watch", filepath.Join(dir, "tasks"), inv, txt, d, true); err != nil {
+	if _, err := Install("vuln-watch", "my-watch", filepath.Join(dir, "tasks"), inv, d, true); err != nil {
 		t.Error(err)
 	}
-	if _, err := Install("nope", "", dir, "", "", d, false); err == nil {
+	if _, err := Install("nope", "", dir, "", d, false); err == nil {
 		t.Error("unknown template accepted")
 	}
 }

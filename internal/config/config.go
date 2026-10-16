@@ -142,7 +142,7 @@ type RetentionConfig struct {
 // InventoryConfig is the default inventory source; tasks may override it.
 type InventoryConfig struct {
 	File   string `yaml:"file"`
-	Format string `yaml:"format"` // yaml | json | csv | auto
+	Format string `yaml:"format"` // yaml | json | csv | mdj | auto
 	// TextFile is the free-text inventory: one product per line, no
 	// device records. Empty means none.
 	TextFile string `yaml:"textFile"`
@@ -285,9 +285,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("egress.subnet %q: %w", c.Egress.Subnet, err)
 	}
 	switch c.Inventory.Format {
-	case "", "auto", "yaml", "json", "csv":
+	case "", "auto", "yaml", "json", "csv", "mdj":
 	default:
-		return fmt.Errorf("unknown inventory.format %q (use: auto, yaml, json, csv)", c.Inventory.Format)
+		return fmt.Errorf("unknown inventory.format %q (use: auto, yaml, json, csv, mdj)", c.Inventory.Format)
 	}
 	for name, s := range c.Sinks {
 		switch s.Type {

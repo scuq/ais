@@ -63,7 +63,8 @@ func GenericPolicy(fields []string) pseudo.Policy {
 		switch l := strings.ToLower(f); {
 		case pseudo.DefaultLabels[l] == "host" || pseudo.DefaultLabels[l] == "ip":
 			p[f] = pseudo.Pseudonym
-		case strings.Contains(l, "comment") || strings.Contains(l, "note") || strings.Contains(l, "remark"):
+		case strings.Contains(l, "comment") || strings.Contains(l, "note") || strings.Contains(l, "remark") ||
+			l == "usage" || l == "interest" || strings.Contains(l, "descr"):
 			p[f] = pseudo.Scrub
 		case strings.Contains(l, "mail") || strings.Contains(l, "owner") || strings.Contains(l, "user"):
 			p[f] = pseudo.Drop

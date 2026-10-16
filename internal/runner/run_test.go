@@ -23,8 +23,8 @@ import (
 func fixture(t *testing.T) (*Runner, *runtime.Fake, *task.Task) {
 	t.Helper()
 	dir := t.TempDir()
-	inv := filepath.Join(dir, "inventory.csv")
-	_ = os.WriteFile(inv, assets.Read("examples/inventory.csv"), 0o600)
+	inv := filepath.Join(dir, "inventory.mdj")
+	_ = os.WriteFile(inv, assets.Read("examples/inventory.mdj"), 0o600)
 	cfg := config.Defaults()
 	cfg.Paths.StateDir = dir
 	cfg.Inventory.File = inv
@@ -33,8 +33,7 @@ func fixture(t *testing.T) (*Runner, *runtime.Fake, *task.Task) {
 	txt := filepath.Join(dir, "inventory.txt")
 	_ = os.WriteFile(txt, []byte("# watch list\nKeycloak 26.1\nGlobalProtect portal on vpn01.cyberdyne.systems (10.1.0.5)\n"), 0o600)
 	cfg.Inventory.TextFile = txt
-	doc := strings.Replace(string(assets.Read("templates/vuln-watch/task.yaml")), "~/.config/ais/inventory.csv", inv, 1)
-	doc = strings.Replace(doc, "~/.config/ais/inventory.txt", txt, 1)
+	doc := strings.Replace(string(assets.Read("templates/vuln-watch/task.yaml")), "~/.config/ais/inventory.mdj", inv, 1)
 	doc = strings.Replace(doc, "sinks: []", "sinks: [splunk]", 1)
 	tk, err := task.Parse([]byte(doc), task.Defaults{Model: "m", MaxTurns: 1, MaxBudgetUSD: 1, Timeout: time.Minute})
 	if err != nil {
@@ -108,8 +107,12 @@ func TestRunSucceedsAndEnriches(t *testing.T) {
 	if strings.Contains(pl.Prompt, "cyberdyne") || strings.Contains(pl.Prompt, "10.1.0.1") {
 		t.Errorf("real values in the logged prompt: %s", pl.Prompt)
 	}
-	if !strings.Contains(pl.Prompt, "notes:") || !strings.Contains(pl.Prompt, "auth using saml") {
-		t.Errorf("comments not collected into the prompt: %s", pl.Prompt)
+	if !strings.Contains(pl.Prompt, "usage:") || !strings.Contains(pl.Prompt, "Authentication with SAML") ||
+		!strings.Contains(pl.Prompt, "interest: Only critical and high findings with an unauthenticated remote attack vector") {
+		t.Errorf("mdj sections not collected into the prompt: %s", pl.Prompt)
+	}
+	if !strings.Contains(pl.Prompt, "- Palo Alto Networks GlobalProtect (no version given) (1 entries)") {
+		t.Errorf("product without a version not in the prompt: %s", pl.Prompt)
 	}
 	ndjson, _ := os.ReadFile(filepath.Join(r.Cfg.RunsDir(), tk.Name, "prompts.ndjson"))
 	if !strings.Contains(string(ndjson), pl.SHA256) {

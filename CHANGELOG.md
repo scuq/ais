@@ -3,7 +3,25 @@
 All notable changes to this project are in this file.
 The format follows Keep a Changelog.
 
-## [Unreleased]
+## [0.3.0] - 2026-10-17
+
+### Added
+
+- The inventory format `mdj` (markdown with JSON). Each system or product has a level 1 heading, a JSON block with the definitive values, and level 2 sections with free text. Each section becomes a field named by its slug. `inventory.format` accepts `mdj`, and `auto` maps the extensions `.mdj` and `.md` to it.
+- A product without device records is an entry without `hostname` and `ip`. An entry without `version` means that ais watches every supported version. The prompt says `(no version given)`, and findings use the `installed_version` `unknown`.
+- `aisctl redact test --format` accepts `mdj`.
+
+### Changed
+
+- Breaking: Run `aisctl init` without `--inventory-text`. The flag no longer exists. Put products without device records into `inventory.mdj` as entries without `hostname`, `ip`, and `version`.
+- Breaking: Move your inventory to `~/.config/ais/inventory.mdj`, or set `inventory.file` in `config.yaml` to your file. The default file name changed from `inventory.csv`. Existing installs keep their `config.yaml`, which names `inventory.csv` and `inventory.txt`, so they run as before.
+- `aisctl init` writes the example `~/.config/ais/inventory.mdj`, and installs the file from `--inventory PATH` under that name. It does not write `inventory.txt`, and the generated `config.yaml` has no `inventory.textFile`.
+- The repository examples `inventory.csv` and `inventory.txt` no longer exist. `assets/examples/inventory.mdj` replaces both, and `assets/examples/config.yaml` points to it.
+- The template `vuln-watch` reads `~/.config/ais/inventory.mdj`, has no `format` key, and has no `textFile`. A `.csv` inventory works with `ais templates use`. The fields `usage` and `interest` have the mode `scrub`, and `expose.prompt.collect` is `[usage, interest, comment]`.
+- The prompt of `vuln-watch` lists `usage:`, `interest:`, and `notes:` for each group, and says `(N entries)` instead of `(N installs)`. The model drops findings that need a feature the usage rules out. Where the entry gives an interest, the model reports only matching findings.
+- `ais templates use` does not substitute a `textFile` path.
+- The template `vuln-watch` runs at `7 7,10-18,20,22 * * *` instead of each hour: once at 07, each hour from 10 to 18, and at 20 and 22. It does not run in the night. Existing task files keep their schedule.
+- Without `--task`, `aisctl redact test` scrubs fields named `usage` or `interest`, and fields with `descr` in the name, besides `comment`, `note`, and `remark`.
 
 ## [0.2.0] - 2026-10-16
 

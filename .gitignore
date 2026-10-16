@@ -18,6 +18,7 @@ coverage.*
 /runs/
 /inventory.csv
 /inventory.txt
+/inventory.mdj
 /config.yaml
 
 # Editors and OS files.
