@@ -3,6 +3,15 @@
 All notable changes to this project are in this file.
 The format follows Keep a Changelog.
 
+## [0.4.0] - 2026-10-17
+
+### Added
+
+- The task key `digest` with `schedule`, `window` (default `24h`), and `always`. The daemon sends a digest to the `sinks` of the task at the scheduled time. Without `always: true`, it sends the digest only when the results of the window have no findings. A digest shows the runs, the findings, the turns, the tokens, and the cost of the window, so a quiet day is not silence. It is a delivery of kind `digest` in the normal queue. `skipEmpty` and the Splunk `split` setting do not apply to it.
+- The command `ais digest <task> [--print] [--window D]`. It sends the digest for the window that ends now at once, or prints the Webex markdown with `--print`. It works for a task without a `digest` key.
+- The column `payload` in the table `deliveries`. ais adds it to an existing database at start.
+- The template `vuln-watch` has `digest: {schedule: "30 22 * * *", window: 24h}`.
+
 ## [0.3.1] - 2026-10-17
 
 ### Changed

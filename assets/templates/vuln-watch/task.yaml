@@ -192,4 +192,12 @@ enrich:
     match: { product: product, installed_version: version }
     attach: { devices: [hostname, ip, site] }
 
+# Daily summary when a day passes without a finding: how many runs, turns,
+# tokens and dollars it took. It goes to the sinks below at 22:30, after the
+# last run of the day. With findings in the window, nothing is sent (set
+# always: true to get the summary anyway).
+digest:
+  schedule: "30 22 * * *"
+  window: 24h
+
 sinks: []

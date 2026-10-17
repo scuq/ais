@@ -94,7 +94,7 @@ The capture in `stdout.json` still gets every line. `ParseEnvelope` finds the re
 | `cmd/ais` | The program entry point. It calls `app.Main`. |
 | `assets` | Embedded files: Containerfile, entrypoint, squid template, allowlists, examples, systemd unit. |
 | `cmd/aisctl`, `internal/aisctl` | The installer and lifecycle tool `aisctl`. `cmd/ais` and `cmd/aisctl` build the same program. Each entry point checks `filepath.Base(os.Args[0])` and starts `aisctl.Main` or `app.Main`. |
-| `internal/app` | The command line. It parses arguments and calls the other packages. It also holds the daemon loop and the retention loop. |
+| `internal/app` | The command line. It parses arguments and calls the other packages. It also holds the daemon loop, the retention loop, and the digest loop (`digestLoop`). |
 | `internal/config` | Defaults, YAML file, environment variables, and validation of the configuration. |
 | `internal/task` | The task schema, defaults, validation, and loading from a directory. |
 | `internal/inventory` | Reads CSV, JSON, YAML, and `mdj` inventories, and the free-text inventory. Builds the minimized groups and gathers the collected values. |
@@ -109,7 +109,7 @@ The capture in `stdout.json` still gets every line. `ParseEnvelope` finds the re
 | `internal/backend` | The operator API, the MCP server, run tokens, and the reverse proxy for the sidecar. |
 | `internal/scheduler` | Cron loops, jitter, parallel limit, reload, and pause. |
 | `internal/store` | The SQLite database. |
-| `internal/sink` | The webhook, NATS, Splunk, and Webex sinks, and the dispatcher. |
+| `internal/sink` | The webhook, NATS, Splunk, and Webex sinks, and the dispatcher. `digest.go` builds the digest event and queues the digest delivery (`QueueDigest`). |
 | `internal/secret` | The encrypted secret store, the passphrase, and the `${secret:NAME}` expansion. |
 | `internal/image` | The image recipe hash, the build, and the check of the Claude Code flags. |
 | `internal/doctor` | The checks of `ais doctor`. |
@@ -261,6 +261,8 @@ When a run ends, the runner writes rows in the table `deliveries` with the state
 
 A `skipped` run and a `cancelled` run get no row.
 
+The digest loop adds a row of kind `digest` for each sink in the task `sinks`. See Digest.
+
 The dispatcher runs in the daemon. Every five seconds it takes up to 50 rows that are `pending` and due. For each row it builds the event, calls the sink, and writes the outcome.
 
 ### Event
@@ -270,6 +272,16 @@ The field `meta` has `model`, `models`, `tokens`, `billing`, `cost_usd`, `num_tu
 The field `model` is the model that did most of the work.
 The field `models` lists each model that the run used, with the highest cost first.
 The field `tokens` has `input`, `output`, `cache_read`, and `cache_creation`. Each value is the sum over all models.
+
+### Digest
+
+The daemon runs `digestLoop`. Every 30 seconds it reads the current tasks. For each enabled task with a `digest` key, it calls `digestDue`. `digestDue` computes the first tick of `digest.schedule` after the last check. It reports a due digest if that tick is not in the future. The loop starts with the daemon start time, so a daemon that was down at the scheduled minute does not send that digest. A reload (SIGHUP) needs no extra step, because the loop reads the current tasks.
+
+`QueueDigest` in `internal/sink/digest.go` reads the finished runs of the window with `Store.RunsBetween`. Without `always`, it queues nothing if the sum of the `findings` arrays is not 0. It writes one row of kind `digest` for each sink in `sinks`, not `alerts`. The row hangs on the newest finished run of the window, or on the newest run of the task if the window has none. It stores the window in `payload`. If the task has no finished run, it returns a reason and the loop logs `digest not sent`.
+
+The dispatcher builds the digest event from `payload` at send time. The field `digest` has `window_start`, `window_end`, `runs`, `succeeded`, `failed`, `skipped`, `findings`, `checked`, and `next_run`. The field `meta` has sums over the runs of the window. `skipEmpty` does not skip a digest, and the Splunk sink does not split it.
+
+`ais digest` builds the same event for the window that ends now and calls the sinks once, without the queue.
 
 ### Retry rules
 
@@ -320,7 +332,7 @@ The database is one SQLite file in WAL mode, `ais.db`, with mode 0600. The conne
 | `leaks` | The values and the context of a leak. |
 | `prompts` | The system prompt, the prompt, and the arguments of each run. The retention rule removes a row with its run. |
 | `run_tokens` | Hashes of the bearer tokens, with expiry and revocation. |
-| `deliveries` | The delivery queue. |
+| `deliveries` | The delivery queue. The column `payload` holds the window of a `digest` row. `migrate` adds it to an existing database. |
 
 CAUTION: The database holds real values: the token map, the clear results, and the leaked values. Protect the state directory like the inventory.
 

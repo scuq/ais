@@ -43,6 +43,9 @@ COMMANDS
     secret <sub>      set NAME [--stdin] | list | delete NAME
                       | passphrase set [--stdin] | passphrase generate
                       (secrets are encrypted at rest with the passphrase file)
+    digest <task>     Send the summary of the last window (runs, turns, tokens,
+                      cost) to the task's sinks now; --print shows it, --window D
+                      sets the window (default: the task's digest.window, 24h)
     hook redact       PostToolUse hook (runs inside the container)
     config show       Print the resolved configuration (--json for JSON)
     doctor            Check the engine and host
@@ -82,6 +85,8 @@ func Main(args []string) int {
 		err = cmdTemplates(p, args[1:])
 	case "sinks":
 		err = cmdSinks(ctx, p, args[1:])
+	case "digest":
+		err = cmdDigest(ctx, p, args[1:])
 	case "run":
 		return cmdRun(ctx, p, args[1:])
 	case "hook":

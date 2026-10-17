@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -164,7 +165,11 @@ func TestMigrateAddsRunColumns(t *testing.T) {
   started_at TEXT NOT NULL, finished_at TEXT, exit_code INTEGER NOT NULL DEFAULT 0, subtype TEXT NOT NULL DEFAULT '',
   model TEXT NOT NULL DEFAULT '', cost_usd REAL NOT NULL DEFAULT 0, num_turns INTEGER NOT NULL DEFAULT 0,
   duration_ms INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '');
-  INSERT INTO runs (id, task, state, started_at, model, cost_usd) VALUES ('old', 't', 'succeeded', '2026-10-16T09:00:00Z', 'm', 0.35);`)
+  INSERT INTO runs (id, task, state, started_at, model, cost_usd) VALUES ('old', 't', 'succeeded', '2026-10-16T09:00:00Z', 'm', 0.35);
+  CREATE TABLE deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, sink TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'result', state TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0, next_at TEXT NOT NULL,
+  last_error TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
+  INSERT INTO deliveries (run_id, sink, state, next_at, updated_at) VALUES ('old', 'w', 'delivered', '2026-10-16T09:01:00Z', '2026-10-16T09:01:00Z');`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,8 +183,47 @@ func TestMigrateAddsRunColumns(t *testing.T) {
 	if err != nil || got.CostUSD != 0.35 || got.InputTokens != 0 || got.Models != "" {
 		t.Errorf("old row after migration: %+v err %v", got, err)
 	}
+	dels, err := s.DeliveriesOf(context.Background(), "old")
+	if err != nil || len(dels) != 1 || dels[0].Payload != "" || dels[0].State != "delivered" {
+		t.Errorf("old delivery after migration: %+v err %v", dels, err)
+	}
 	// A second open must be a no-op.
 	if _, err := Open(path); err != nil {
 		t.Errorf("reopen: %v", err)
+	}
+}
+
+func TestRunsBetweenAndPayload(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "ais.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	base := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	for i, st := range []string{StateSucceeded, StateFailed, StateRunning, StateSucceeded} {
+		id := fmt.Sprintf("r%d", i)
+		_ = s.InsertRun(ctx, Run{ID: id, Task: "t", State: StateRunning, StartedAt: base.Add(time.Duration(i) * time.Hour)})
+		if st != StateRunning {
+			_ = s.FinishRun(ctx, Run{ID: id, State: st, FinishedAt: base.Add(time.Duration(i)*time.Hour + time.Minute)})
+		}
+	}
+	runs, err := s.RunsBetween(ctx, "t", base, base.Add(3*time.Hour))
+	if err != nil || len(runs) != 2 || runs[0].ID != "r0" || runs[1].ID != "r1" {
+		t.Errorf("runs between: %+v err %v", runs, err)
+	}
+	if runs, _ := s.RunsBetween(ctx, "t", base, base.Add(4*time.Hour)); len(runs) != 3 {
+		t.Errorf("r3 missing: %+v", runs)
+	}
+	if err := s.EnqueueDeliveryPayload(ctx, "r3", "w", "digest", `{"window_end":"x"}`, base); err != nil {
+		t.Fatal(err)
+	}
+	dels, _ := s.DeliveriesOf(ctx, "r3")
+	if len(dels) != 1 || dels[0].Kind != "digest" || dels[0].Payload != `{"window_end":"x"}` {
+		t.Errorf("payload: %+v", dels)
+	}
+	due, _ := s.DueDeliveries(ctx, base, 10)
+	if len(due) != 1 || due[0].Payload == "" {
+		t.Errorf("due payload: %+v", due)
 	}
 }

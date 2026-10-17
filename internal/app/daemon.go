@@ -235,6 +235,8 @@ func cmdDaemon(ctx context.Context, p *output.Printer, args []string) error {
 	go func() { defer wg.Done(); retentionLoop(runCtx, cfg, st, log) }()
 	wg.Add(1)
 	go func() { defer wg.Done(); tokenAgeLoop(runCtx, cfg, secrets, log) }()
+	wg.Add(1)
+	go func() { defer wg.Done(); digestLoop(runCtx, st, currentTasks, sched.Next, loc, log) }()
 	sched.Start(runCtx)
 	log.Info("ais daemon up", "version", Version, "engine", rt.Engine(), "tasks", len(tasks), "socket", cfg.BackendSocket(), "mcp_socket", backend.MCPSocket(cfg))
 	for _, u := range sched.Next() {
@@ -280,6 +282,64 @@ func cmdDaemon(ctx context.Context, p *output.Printer, args []string) error {
 			}
 		}
 	}
+}
+
+// digestLoop queues the digest of each task whose digest schedule came due
+// since the last tick. It reads the current tasks on every tick, so a
+// reload needs no extra plumbing. A daemon that was down at the scheduled
+// minute does not send that digest.
+func digestLoop(ctx context.Context, st *store.Store, tasks func() []*task.Task, next func() []scheduler.Upcoming, loc *time.Location, log *slog.Logger) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	start := time.Now()
+	last := map[string]time.Time{}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		now := time.Now()
+		for _, tk := range tasks() {
+			if tk.Digest == nil || (tk.Enabled != nil && !*tk.Enabled) {
+				continue
+			}
+			since := last[tk.Name]
+			if since.IsZero() {
+				since = start
+			}
+			due, ok := digestDue(tk.Digest.Schedule, since, now, loc)
+			if !ok {
+				continue
+			}
+			last[tk.Name] = now
+			var nextRun *time.Time
+			for _, u := range next() {
+				if u.Task == tk.Name {
+					at := u.At
+					nextRun = &at
+				}
+			}
+			reason, err := sink.QueueDigest(ctx, st, tk, due, nextRun, now)
+			switch {
+			case err != nil:
+				log.Error("digest not queued", "task", tk.Name, "error", err)
+			case reason != "":
+				log.Info("digest not sent", "task", tk.Name, "reason", reason)
+			default:
+				log.Info("digest queued", "task", tk.Name, "window_end", due.Format(time.RFC3339), "sinks", len(tk.Sinks))
+			}
+		}
+	}
+}
+
+// digestDue returns the first tick of expr after since, if it has passed.
+func digestDue(expr string, since, now time.Time, loc *time.Location) (time.Time, bool) {
+	at, err := scheduler.NextRun(expr, since, loc)
+	if err != nil || at.After(now) {
+		return time.Time{}, false
+	}
+	return at, true
 }
 
 // reloadPolicy re-reads config.yaml on SIGHUP and applies its pii: section.

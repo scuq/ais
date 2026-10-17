@@ -21,6 +21,11 @@ that an earlier run checked, unless the source was updated after that run.
 This saves the turns that a new check of the same item costs. The sinks show
 only `findings`.
 
+Digest: the task key `digest` sends a summary at 22:30 (`scheduler.timezone`)
+when the results of the last 24 hours have no finding. The last run of the day
+is at 22:07. The digest shows the runs, the turns, and the items checked, so a
+day without findings is not silence. It goes to the `sinks`.
+
 Schedule: `7 7,10-18,20,22 * * *`. The task runs at minute 7: once at 07, at
 each hour from 10 to 18, and at 20 and 22. It does not run in the night. Most
 advisories are published between 09 and 18. The prompt looks back 24 hours, so

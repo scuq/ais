@@ -144,7 +144,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
   attempt INTEGER NOT NULL DEFAULT 0,
   next_at TEXT NOT NULL,
   last_error TEXT NOT NULL DEFAULT '',
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries(state, next_at);
 `
@@ -160,20 +161,31 @@ var runColumnsAdded = []struct{ name, def string }{
 	{"models", "TEXT NOT NULL DEFAULT ''"},
 }
 
+// deliveryColumnsAdded lists the columns added to deliveries after the
+// first release. payload carries the window of a digest delivery.
+var deliveryColumnsAdded = []struct{ name, def string }{
+	{"payload", "TEXT NOT NULL DEFAULT ''"},
+}
+
 func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return err
 	}
-	have, err := s.columns(ctx, "runs")
-	if err != nil {
-		return err
-	}
-	for _, c := range runColumnsAdded {
-		if have[c.name] {
-			continue
+	for _, m := range []struct {
+		table string
+		cols  []struct{ name, def string }
+	}{{"runs", runColumnsAdded}, {"deliveries", deliveryColumnsAdded}} {
+		have, err := s.columns(ctx, m.table)
+		if err != nil {
+			return err
 		}
-		if _, err := s.db.ExecContext(ctx, `ALTER TABLE runs ADD COLUMN `+c.name+` `+c.def); err != nil {
-			return fmt.Errorf("store: add column runs.%s: %w", c.name, err)
+		for _, c := range m.cols {
+			if have[c.name] {
+				continue
+			}
+			if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+m.table+` ADD COLUMN `+c.name+` `+c.def); err != nil {
+				return fmt.Errorf("store: add column %s.%s: %w", m.table, c.name, err)
+			}
 		}
 	}
 	return nil
@@ -331,6 +343,27 @@ func (s *Store) ListRuns(ctx context.Context, task, state string, limit int) ([]
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+runCols+` FROM runs WHERE (?='' OR task=?) AND (?='' OR state=?) ORDER BY started_at DESC LIMIT ?`,
 		task, task, state, state, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Run
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RunsBetween returns the finished runs of a task that started in
+// [start, end), oldest first. A run that is still queued or running is
+// left out.
+func (s *Store) RunsBetween(ctx context.Context, task string, start, end time.Time) ([]Run, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+runCols+` FROM runs WHERE task=? AND started_at>=? AND started_at<? AND state NOT IN (?, ?) ORDER BY started_at`,
+		task, ts(start), ts(end), StateQueued, StateRunning)
 	if err != nil {
 		return nil, err
 	}
@@ -677,18 +710,26 @@ type Delivery struct {
 	NextAt    time.Time `json:"nextAt"`
 	LastError string    `json:"lastError"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	// Payload is extra input of the event, JSON. A digest delivery keeps
+	// its window here; a result or alert delivery has none.
+	Payload string `json:"payload,omitempty"`
 }
 
 // EnqueueDelivery adds a pending delivery.
 func (s *Store) EnqueueDelivery(ctx context.Context, runID, sink, kind string, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO deliveries (run_id, sink, kind, state, attempt, next_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?)`,
-		runID, sink, kind, DeliveryPending, ts(now), ts(now))
+	return s.EnqueueDeliveryPayload(ctx, runID, sink, kind, "", now)
+}
+
+// EnqueueDeliveryPayload adds a pending delivery that carries a payload.
+func (s *Store) EnqueueDeliveryPayload(ctx context.Context, runID, sink, kind, payload string, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO deliveries (run_id, sink, kind, state, attempt, next_at, updated_at, payload) VALUES (?, ?, ?, ?, 0, ?, ?, ?)`,
+		runID, sink, kind, DeliveryPending, ts(now), ts(now), payload)
 	return err
 }
 
 // DueDeliveries returns pending deliveries whose next_at has passed.
 func (s *Store) DueDeliveries(ctx context.Context, now time.Time, limit int) ([]Delivery, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, sink, kind, state, attempt, next_at, last_error, updated_at FROM deliveries WHERE state=? AND next_at<=? ORDER BY next_at LIMIT ?`, DeliveryPending, ts(now), limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, sink, kind, state, attempt, next_at, last_error, updated_at, payload FROM deliveries WHERE state=? AND next_at<=? ORDER BY next_at LIMIT ?`, DeliveryPending, ts(now), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -698,7 +739,7 @@ func (s *Store) DueDeliveries(ctx context.Context, now time.Time, limit int) ([]
 
 // DeliveriesOf returns the deliveries of a run.
 func (s *Store) DeliveriesOf(ctx context.Context, runID string) ([]Delivery, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, sink, kind, state, attempt, next_at, last_error, updated_at FROM deliveries WHERE run_id=? ORDER BY id`, runID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, sink, kind, state, attempt, next_at, last_error, updated_at, payload FROM deliveries WHERE run_id=? ORDER BY id`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -711,7 +752,7 @@ func scanDeliveries(rows *sql.Rows) ([]Delivery, error) {
 	for rows.Next() {
 		var d Delivery
 		var next, upd string
-		if err := rows.Scan(&d.ID, &d.RunID, &d.Sink, &d.Kind, &d.State, &d.Attempt, &next, &d.LastError, &upd); err != nil {
+		if err := rows.Scan(&d.ID, &d.RunID, &d.Sink, &d.Kind, &d.State, &d.Attempt, &next, &d.LastError, &upd, &d.Payload); err != nil {
 			return nil, err
 		}
 		d.NextAt = parseTS(next)

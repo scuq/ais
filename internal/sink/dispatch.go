@@ -111,7 +111,7 @@ func (d *Dispatcher) deliver(ctx context.Context, del store.Delivery) {
 		fail(fmt.Errorf("sink %q is not configured", del.Sink), true)
 		return
 	}
-	ev, err := d.LoadEvent(ctx, del.RunID, del.Kind)
+	ev, err := d.LoadDelivery(ctx, del)
 	if err != nil {
 		fail(err, true)
 		return
@@ -129,6 +129,23 @@ func (d *Dispatcher) deliver(ctx context.Context, del store.Delivery) {
 	}
 	log.Info("delivered")
 	_ = d.Store.UpdateDelivery(ctx, del.ID, store.DeliveryDelivered, del.Attempt+1, now, "", now)
+}
+
+// LoadDelivery builds the event of a queued delivery. A digest delivery
+// takes its window from the payload; a result or alert is loaded by run.
+func (d *Dispatcher) LoadDelivery(ctx context.Context, del store.Delivery) (Event, error) {
+	if del.Kind != "digest" {
+		return d.LoadEvent(ctx, del.RunID, del.Kind)
+	}
+	var p DigestPayload
+	if err := json.Unmarshal([]byte(del.Payload), &p); err != nil || p.WindowEnd.IsZero() {
+		return Event{}, fmt.Errorf("digest delivery %d has no window payload", del.ID)
+	}
+	r, err := d.Store.GetRun(ctx, del.RunID)
+	if err != nil {
+		return Event{}, err
+	}
+	return d.LoadDigest(ctx, r.Task, p)
 }
 
 // LoadEvent builds the event for a run from the store.

@@ -23,7 +23,7 @@ import (
 
 // Event is what a sink receives.
 type Event struct {
-	Kind       string    `json:"kind"` // result | alert
+	Kind       string    `json:"kind"` // result | alert | digest
 	Task       string    `json:"task"`
 	RunID      string    `json:"run_id"`
 	State      string    `json:"state"`
@@ -35,7 +35,10 @@ type Event struct {
 	// Leaks lists the inventory fields whose real values appeared in model
 	// output (for leak alerts). The values themselves never leave the host.
 	Leaks []string `json:"leaks,omitempty"`
-	Meta  Meta     `json:"meta"`
+	// Digest summarises a window of runs (digest events). Meta then holds
+	// the sums over those runs.
+	Digest *Digest `json:"digest,omitempty"`
+	Meta   Meta    `json:"meta"`
 }
 
 // Meta is run metadata attached to every event.

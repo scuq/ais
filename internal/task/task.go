@@ -63,12 +63,26 @@ type Task struct {
 
 	Enrich []EnrichRule `yaml:"enrich"`
 	Sinks  []string     `yaml:"sinks"`
+	Digest *Digest      `yaml:"digest"`
 
 	// Derived, not from YAML.
 	Path   string `yaml:"-"`
 	Hash   string `yaml:"-"`
 	schema []byte
 }
+
+// Digest is the periodic summary of a task: how many runs, turns, tokens
+// and dollars a window took. The daemon sends it to the task's sinks on
+// Schedule when the window had no finding, so a quiet day is visible as
+// work done, not as silence. Always sends it also when there were findings.
+type Digest struct {
+	Schedule string        `yaml:"schedule"`
+	Window   time.Duration `yaml:"window"` // default 24h
+	Always   bool          `yaml:"always"`
+}
+
+// DefaultDigestWindow is the window of a digest that sets none.
+const DefaultDigestWindow = 24 * time.Hour
 
 // InventoryRef overrides the configured inventory sources. Each key that
 // is set replaces the global one; an empty key keeps the global value.
@@ -227,6 +241,9 @@ func Parse(data []byte, d Defaults) (*Task, error) {
 	if t.MaxBudgetUSD == 0 {
 		t.MaxBudgetUSD = d.MaxBudgetUSD
 	}
+	if t.Digest != nil && t.Digest.Window == 0 {
+		t.Digest.Window = DefaultDigestWindow
+	}
 	if t.Timeout == 0 {
 		t.Timeout = d.Timeout
 	}
@@ -341,6 +358,20 @@ func (t *Task) Validate() error {
 	}
 	if t.Jitter != nil && *t.Jitter < 0 {
 		return errors.New("jitter must not be negative")
+	}
+	if d := t.Digest; d != nil {
+		if d.Schedule == "" {
+			return errors.New("digest.schedule is required")
+		}
+		if !gronx.IsValid(d.Schedule) {
+			return fmt.Errorf("digest.schedule %q is not a valid cron expression", d.Schedule)
+		}
+		if fields := strings.Fields(d.Schedule); !strings.HasPrefix(d.Schedule, "@") && len(fields) != 5 {
+			return fmt.Errorf("digest.schedule %q must have 5 fields (minute hour day month weekday) or be @daily", d.Schedule)
+		}
+		if d.Window <= 0 {
+			return errors.New("digest.window must be positive")
+		}
 	}
 	if t.MaxTurns <= 0 {
 		return errors.New("maxTurns must be positive")

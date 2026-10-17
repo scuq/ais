@@ -208,6 +208,8 @@ func WebexMarkdown(title string, ev Event, maxItems int) string {
 	var b strings.Builder
 	when := ev.FinishedAt.Local().Format("2006-01-02 15:04")
 	switch ev.Kind {
+	case "digest":
+		return digestMarkdown(title, ev, when)
 	case "alert":
 		fmt.Fprintf(&b, "⚠️ **%s**: run `%s` %s", title, ev.RunID, ev.State)
 		if ev.Reason != "" {
@@ -254,6 +256,38 @@ func WebexMarkdown(title string, ev Event, maxItems int) string {
 	}
 	fmt.Fprintf(&b, "_%s · run %s · %d turns · %s_", when, ev.RunID, ev.Meta.NumTurns, costLine(ev))
 	return truncateTo(b.String(), webexMaxMarkdown)
+}
+
+// digestMarkdown renders a digest event: the headline says whether the
+// window had findings, the second line says what the runs did, the footer
+// gives the summed usage and the next run.
+func digestMarkdown(title string, ev Event, when string) string {
+	dg := ev.Digest
+	if dg == nil {
+		return fmt.Sprintf("**%s**: digest without data", title)
+	}
+	var b strings.Builder
+	if dg.Findings == 0 {
+		fmt.Fprintf(&b, "✅ **%s**: nothing found in the last %s\n", title, dg.WindowLabel())
+	} else {
+		fmt.Fprintf(&b, "🔎 **%s**: %d finding(s) in the last %s\n", title, dg.Findings, dg.WindowLabel())
+	}
+	b.WriteString(digestStats(dg, ev))
+	fmt.Fprintf(&b, "\n_%s · %s", when, costLine(ev))
+	if dg.NextRun != nil {
+		fmt.Fprintf(&b, " · next run %s", dg.NextRun.Local().Format("2006-01-02 15:04"))
+	}
+	b.WriteString("_")
+	return b.String()
+}
+
+// digestStats is the middle line of a digest: runs, turns, checked items.
+func digestStats(dg *Digest, ev Event) string {
+	parts := []string{dg.RunsLine(), fmt.Sprintf("%d turns", ev.Meta.NumTurns)}
+	if dg.Checked != nil {
+		parts = append(parts, fmt.Sprintf("%d items checked", *dg.Checked))
+	}
+	return strings.Join(parts, " · ")
 }
 
 // headline is "Vendor Product — Title", or the CVE list when the finding
@@ -395,6 +429,13 @@ func WebexCard(title string, ev Event, maxItems int) map[string]any {
 	body := []any{map[string]any{"type": "TextBlock", "size": "Medium", "weight": "Bolder", "text": title, "wrap": true}}
 	fs, ok := findings(ev.Result)
 	switch {
+	case ev.Kind == "digest" && ev.Digest != nil:
+		head, color := fmt.Sprintf("Nothing found in the last %s", ev.Digest.WindowLabel()), "Good"
+		if ev.Digest.Findings > 0 {
+			head, color = fmt.Sprintf("%d finding(s) in the last %s", ev.Digest.Findings, ev.Digest.WindowLabel()), "Accent"
+		}
+		body = append(body, map[string]any{"type": "TextBlock", "text": head, "wrap": true, "color": color},
+			map[string]any{"type": "TextBlock", "text": digestStats(ev.Digest, ev), "wrap": true})
 	case ev.Kind == "alert":
 		body = append(body, map[string]any{"type": "TextBlock", "text": fmt.Sprintf("Run %s %s (%s)", ev.RunID, ev.State, ev.Reason), "wrap": true, "color": "Attention"})
 		if ev.Error != "" {
@@ -440,8 +481,14 @@ func WebexCard(title string, ev Event, maxItems int) map[string]any {
 			}
 		}
 	}
-	body = append(body, map[string]any{"type": "TextBlock", "isSubtle": true, "size": "Small", "wrap": true,
-		"text": fmt.Sprintf("%s · run %s · %d turns · %s", ev.FinishedAt.Local().Format("2006-01-02 15:04"), ev.RunID, ev.Meta.NumTurns, costLine(ev))})
+	footer := fmt.Sprintf("%s · run %s · %d turns · %s", ev.FinishedAt.Local().Format("2006-01-02 15:04"), ev.RunID, ev.Meta.NumTurns, costLine(ev))
+	if ev.Kind == "digest" && ev.Digest != nil {
+		footer = fmt.Sprintf("%s · %s", ev.FinishedAt.Local().Format("2006-01-02 15:04"), costLine(ev))
+		if ev.Digest.NextRun != nil {
+			footer += " · next run " + ev.Digest.NextRun.Local().Format("2006-01-02 15:04")
+		}
+	}
+	body = append(body, map[string]any{"type": "TextBlock", "isSubtle": true, "size": "Small", "wrap": true, "text": footer})
 	card := map[string]any{
 		"type": "AdaptiveCard", "$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "version": "1.3", "body": body,
 	}

@@ -84,3 +84,29 @@ func TestValidationErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestDigestKey(t *testing.T) {
+	tk := mustParse(t, minimal+"digest: {schedule: \"30 22 * * *\"}\n")
+	if tk.Digest == nil || tk.Digest.Window != DefaultDigestWindow || tk.Digest.Always {
+		t.Errorf("digest defaults: %+v", tk.Digest)
+	}
+	tk = mustParse(t, minimal+"digest: {schedule: \"@daily\", window: 48h, always: true}\n")
+	if tk.Digest.Window != 48*time.Hour || !tk.Digest.Always {
+		t.Errorf("digest: %+v", tk.Digest)
+	}
+	for name, doc := range map[string]string{
+		"no schedule": minimal + "digest: {window: 24h}\n",
+		"bad cron":    minimal + "digest: {schedule: \"99 * * * *\"}\n",
+		"six fields":  minimal + "digest: {schedule: \"0 0 22 * * *\"}\n",
+		"bad window":  minimal + "digest: {schedule: \"@daily\", window: -1h}\n",
+		"unknown key": minimal + "digest: {schedule: \"@daily\", at: 22}\n",
+	} {
+		tk, err := Parse([]byte(doc), defs)
+		if err == nil {
+			err = tk.Validate()
+		}
+		if err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

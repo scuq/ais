@@ -9,6 +9,7 @@
     ais tasks list [--json] | validate | show <task>
     ais tasks set <task> key=value...
     ais sinks list | test <sink> [--run RUN-ID] [--print]
+    ais digest <task> [--print] [--window D]
     ais templates list [--json] | show <name> | use <name> [--as NAME] [--force]
     ais runs list [--task T] [--state S] [-n N] [--json]
     ais runs show [--clear] [--prompt] [--json] <run-id>
@@ -440,6 +441,44 @@ A line whose fact is missing from the finding is not shown, except the first fiv
 ais truncates a message to 7000 characters. If a result has no findings, the message is a line with a green check mark. To send nothing in this case, set `skipEmpty: true` on the sink. An alert event gives a warning line with the reason, the error, and the names of the leaked fields. A result without a `findings` array is sent as a JSON code block.
 With `card: true`, the message also has an Adaptive Card (version 1.3) with the same content and up to 3 `Action.OpenUrl` buttons.
 
+### Digest
+
+A digest is a short summary of what the runs of a task did in a window. With `skipEmpty: true`, a day without findings sends nothing. A digest shows that the task did work on that day.
+
+The task key `digest` is a map:
+
+| Key | Meaning |
+|---|---|
+| `schedule` | Required. A cron expression with five fields, or a descriptor such as `@daily`. ais reads it in `scheduler.timezone`. |
+| `window` | Length of the window that ends at the scheduled time. It must be positive. Default: `24h`. |
+| `always` | If `true`, ais sends the digest in any case. If `false`, ais sends it only when the sum of the `findings` arrays of the results in the window is 0. Default: `false`. |
+
+Example: `digest: {schedule: "30 22 * * *", window: 24h}` sends a digest at 22:30 on a day without findings.
+
+The daemon checks every 30 seconds if the `digest.schedule` of a task came due. After a reload (SIGHUP), it uses the changed schedules. If the daemon was down at the scheduled minute, it does not send that digest.
+
+ais sends the digest to the `sinks` of the task, not to `alerts`. It queues the digest as a delivery of kind `digest`, so retries, backoff, and `dead` apply, and `ais runs show` lists it.
+The delivery belongs to the newest finished run in the window. If the window has no finished run, it belongs to the newest run of the task. The window is stored in the column `payload` of the table `deliveries`. ais adds this column to an existing database at start.
+A task with no finished run gets no digest, and the daemon logs `digest not sent`. A task without sinks gets none.
+
+The event has `kind: digest`, `task`, `run_id` (the run of the delivery), `state: digest`, and `finished_at` (the window end). The field `digest` has these keys:
+
+- `window_start` and `window_end`.
+- `runs`, `succeeded`, `failed`, `skipped`, and `findings`. `failed` counts runs in the state `failed`, `leaked`, and `timeout`. `skipped` counts runs skipped because of overlap, and cancelled runs.
+- `checked`, only if the results have a `checked` list.
+- `next_run`.
+
+The field `meta` has the sums over the runs of the window: `models` (each model once, in order of use), `tokens`, `cost_usd`, `num_turns`, and `duration_ms`.
+Webhook and NATS sinks receive the event as JSON. The Splunk `split` setting does not apply to a digest, so Splunk gets one event. `skipEmpty` does not apply to a digest.
+
+A Webex sink shows a digest like this:
+
+1. A headline: `✅ **<title>**: nothing found in the last 24 h`. With `always: true` and findings, it is `🔎 **<title>**: N finding(s) in the last 24 h`.
+2. A line such as `12 run(s) (11 succeeded, 1 failed) · 290 turns · 184 items checked`.
+3. A footer with the window end, the models, the tokens, the billing, and the next run, for example `<window end> · <models> · <in>k in / <out>k out · subscription (est. $x) · next run <time>`.
+
+With `card: true`, the Adaptive Card has the same content.
+
 CAUTION: The device names come from the enrich rules. A Webex message contains real hostnames by design. Send it only to a space that may see them.
 
 ## Task reference
@@ -491,6 +530,7 @@ To change top-level keys without an editor, use `ais tasks set`.
 | `outputSchemaFile` | none | Path of a JSON Schema file. A relative path starts at the directory of the task file. |
 | `enrich` | none | List of rules that attach inventory data to the result on the host. |
 | `sinks` | none | Names of sinks from `config.yaml`. |
+| `digest` | none | Map that sends a periodic summary to the `sinks`. See Digest. The command `ais tasks set` does not change it. |
 
 Exactly one of `outputSchema` and `outputSchemaFile` is necessary. ais compiles the schema when it loads the task.
 
@@ -544,6 +584,7 @@ The new field holds a list with one object for each inventory record that matche
 | `ais templates list` | List the task templates in the binary. `--json` prints JSON. |
 | `ais templates show <name>` | Print the description and the task file of a template. |
 | `ais templates use <name>` | Copy a template into the tasks directory. It sets the task name and the inventory path, and checks the task. `--as NAME` sets another task name. `--force` replaces an existing file. |
+| `ais digest <task>` | Build the digest for the window that ends now and send it to the sinks of the task at once. ais tries once and does not queue it. `--print` prints the Webex markdown and sends nothing. `--window D` sets the window, as a duration such as `24h` or `168h`. Default: `digest.window` of the task, or `24h` if the task has no `digest` key. It works for a task without a `digest` key. |
 | `ais runs redeliver <run-id>` | Queue all deliveries of the run again. `--sink S` limits it to one sink. |
 | `ais image build` | Build the run image from the recipe in the binary. `--no-cache` ignores the layer cache. |
 | `ais image status` | Print whether the image exists and matches the recipe of this binary. |
@@ -931,7 +972,7 @@ The dispatcher in the daemon checks the queue every five seconds.
 To send the results of a run again, run `ais runs redeliver <run-id>`. The command resets all deliveries of the run, or of one sink with `--sink`, including completed ones.
 The daemon sends them. `ais runs show <run-id>` lists the state of each delivery.
 
-The NATS sink sets a message ID of the form `<run-id>/<kind>/<sink>`. JetStream uses it to detect a duplicate.
+The NATS sink sets a message ID of the form `<run-id>/<kind>/<sink>`. JetStream uses it to detect a duplicate. For a digest, `<kind>` is `digest`.
 
 ### Retention
 

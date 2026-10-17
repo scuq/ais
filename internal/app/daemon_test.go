@@ -67,3 +67,23 @@ func TestConfigOutsidePIIChanged(t *testing.T) {
 		t.Error("runtime change must count")
 	}
 }
+
+func TestDigestDue(t *testing.T) {
+	loc := time.UTC
+	since := time.Date(2026, 10, 17, 22, 0, 0, 0, loc)
+	if _, ok := digestDue("30 22 * * *", since, since.Add(29*time.Minute), loc); ok {
+		t.Error("due before the minute")
+	}
+	at, ok := digestDue("30 22 * * *", since, since.Add(31*time.Minute), loc)
+	if !ok || !at.Equal(time.Date(2026, 10, 17, 22, 30, 0, 0, loc)) {
+		t.Errorf("due: %v %v", at, ok)
+	}
+	// A tick that comes a day late still fires once, for the first missed minute.
+	at, ok = digestDue("30 22 * * *", since, since.Add(26*time.Hour), loc)
+	if !ok || at.Day() != 17 {
+		t.Errorf("late tick: %v %v", at, ok)
+	}
+	if _, ok := digestDue("bad", since, since.Add(time.Hour), loc); ok {
+		t.Error("invalid expression fired")
+	}
+}
