@@ -30,6 +30,11 @@ COMMANDS
                 inventory values the policy would miss
     templates list | show NAME | use NAME [--as NAME] [--force]
                 Shipped task templates (same as 'ais templates')
+    inventory <sub> [--file PATH]
+                Maintain inventory.mdj without an editor: list | show | set TITLE
+                key=value... | add TITLE key=value... | rm TITLE | apply FILE |
+                import panorama FILE. 'list' and 'show' pseudonymize hostnames
+                and addresses, so their output can go to a model
     prompts [list [--task T] [-n N]] | show RUN-ID | last [--task T]
                 The prompts that were sent to the model, including dry runs
     run TASK [--live] [--dry-run]
@@ -95,6 +100,8 @@ func Main(args []string) int {
 		err = runRedact(ctx, e, args[1:])
 	case "templates":
 		return app.Main(append([]string{"templates"}, args[1:]...))
+	case "inventory":
+		err = runInventory(ctx, e, args[1:])
 	case "prompts":
 		err = Prompts(ctx, e, args[1:])
 	case "run":

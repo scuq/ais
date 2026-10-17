@@ -93,11 +93,11 @@ The capture in `stdout.json` still gets every line. `ParseEnvelope` finds the re
 |---|---|
 | `cmd/ais` | The program entry point. It calls `app.Main`. |
 | `assets` | Embedded files: Containerfile, entrypoint, squid template, allowlists, examples, systemd unit. |
-| `cmd/aisctl`, `internal/aisctl` | The installer and lifecycle tool `aisctl`. `cmd/ais` and `cmd/aisctl` build the same program. Each entry point checks `filepath.Base(os.Args[0])` and starts `aisctl.Main` or `app.Main`. |
+| `cmd/aisctl`, `internal/aisctl` | The installer and lifecycle tool `aisctl`. `cmd/ais` and `cmd/aisctl` build the same program. Each entry point checks `filepath.Base(os.Args[0])` and starts `aisctl.Main` or `app.Main`. `inventory.go` holds the `aisctl inventory` subcommands. They pseudonymize with `pseudo.Redactor`, keep the map in `inventory.redact-map.json` in the state directory, and back up the file before each write. |
 | `internal/app` | The command line. It parses arguments and calls the other packages. It also holds the daemon loop, the retention loop, and the digest loop (`digestLoop`). |
 | `internal/config` | Defaults, YAML file, environment variables, and validation of the configuration. |
 | `internal/task` | The task schema, defaults, validation, and loading from a directory. |
-| `internal/inventory` | Reads CSV, JSON, YAML, and `mdj` inventories, and the free-text inventory. Builds the minimized groups and gathers the collected values. |
+| `internal/inventory` | Reads CSV, JSON, YAML, and `mdj` inventories, and the free-text inventory. Builds the minimized groups and gathers the collected values. `Document` is the parsed `mdj` structure: entries with a title, ordered JSON values, and sections. `mdj.go` parses it and writes it again (round trip). `panorama.go` reads a Panorama CSV export and merges it into a `Document`. The grouping adds the reserved field `count` (`CountField`). The records view has the field `title`. |
 | `internal/templates` | The task templates in the binary: list, show, and install. |
 | `internal/pseudo` | Field policy, tokens, token map, depseudonymization, redactor, and leak check. |
 | `internal/prompt` | Renders the prompt and the other input files. |

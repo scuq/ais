@@ -122,6 +122,8 @@ func stringify(v any) string {
 		return ""
 	case string:
 		return x
+	case json.Number:
+		return x.String()
 	case float64:
 		if x == float64(int64(x)) {
 			return fmt.Sprintf("%d", int64(x))
@@ -180,7 +182,7 @@ const MaxCollected = 20
 
 // Minimize returns the distinct tuples of the given fields, sorted by their
 // values in field order, with the distinct values of collect gathered per
-// group.
+// group. A record counts as its count field (CountField), or once.
 func Minimize(recs []Record, by []string, collect []string) []Group {
 	idx := map[string]int{}
 	seen := map[string]map[string]map[string]bool{}
@@ -200,7 +202,7 @@ func Minimize(recs []Record, by []string, collect []string) []Group {
 			out = append(out, Group{Fields: fields})
 			seen[k] = map[string]map[string]bool{}
 		}
-		out[i].Count++
+		out[i].Count += r.Count()
 		for _, c := range collect {
 			v := strings.TrimSpace(r.Fields[c])
 			if v == "" {

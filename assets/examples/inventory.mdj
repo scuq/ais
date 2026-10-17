@@ -1,54 +1,40 @@
 Inventory in mdj format (markdown with JSON). ais ignores this text, because
 it is above the first level 1 heading.
 
-- One level 1 heading for each system or product.
+- One level 1 heading for each role, system or product.
 - Directly below the heading: one JSON block with the definitive values.
+- "count" is the number of installs the entry stands for. Without it, an
+  entry counts once. Hostname and IP are optional: give them when you want
+  the device named in the alert, leave them out when the role is enough.
 - Level 2 headings: free text. "## Usage" becomes the field "usage", and
   "## Interest" becomes the field "interest". The task's field policy
   decides what the model sees of each field.
 - A product without a device record has no hostname and no ip. Without a
   version, every supported version is watched.
+- Maintain the file with 'aisctl inventory' (list, set, add, rm, import),
+  which never shows a real address.
 
-# fw01.cyberdyne.systems
+# Internet edge firewalls
 
 ```json
 {
-  "hostname": "fw01.cyberdyne.systems",
-  "ip": "10.1.0.1",
-  "site": "earth",
   "vendor": "Palo Alto Networks",
   "product": "PAN-OS",
   "version": "11.1.4",
-  "owner_email": "netops@cyberdyne.systems"
+  "count": 2,
+  "site": "earth"
 }
 ```
 
 ## Usage
 
-Edge firewall, internet facing. No GlobalProtect VPN and no other services on
-the internet facing interfaces. The management interface is firewall protected.
+Edge firewalls, internet facing. No GlobalProtect VPN and no other services
+on the internet facing interfaces. The management interface is firewall
+protected.
 
 ## Interest
 
 Only critical and high findings with an unauthenticated remote attack vector.
-
-# fw02.cyberdyne.systems
-
-```json
-{
-  "hostname": "fw02.cyberdyne.systems",
-  "ip": "10.2.0.1",
-  "site": "mars",
-  "vendor": "Palo Alto Networks",
-  "product": "PAN-OS",
-  "version": "11.1.4",
-  "owner_email": "netops@cyberdyne.systems"
-}
-```
-
-## Usage
-
-Edge firewall, internet facing. Management through jump01.cyberdyne.systems.
 
 # vpn01.cyberdyne.systems
 
@@ -68,23 +54,21 @@ Edge firewall, internet facing. Management through jump01.cyberdyne.systems.
 
 SSL VPN gateway, internet facing. Authentication with SAML.
 
-# sw-core-01.cyberdyne.systems
+# Core switches
 
 ```json
 {
-  "hostname": "sw-core-01.cyberdyne.systems",
-  "ip": "192.168.10.10",
-  "site": "venus",
   "vendor": "Cisco",
   "product": "IOS XE",
   "version": "17.9.5",
-  "owner_email": "netops@cyberdyne.systems"
+  "count": 4,
+  "site": "venus"
 }
 ```
 
 ## Usage
 
-Core switch, internal only. The web UI is disabled. No SAML.
+Core switches, internal only. The web UI is disabled. No SAML.
 
 # app01.cyberdyne.systems
 

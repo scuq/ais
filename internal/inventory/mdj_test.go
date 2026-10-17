@@ -30,7 +30,7 @@ func TestParseMDJ(t *testing.T) {
 	if f["interest"] != "Only critical. ### Detail stays in interest" {
 		t.Errorf("interest: %q", f["interest"])
 	}
-	if len(recs[1].Fields) != 1 || recs[1].Fields["product"] != "Keycloak" {
+	if len(recs[1].Fields) != 2 || recs[1].Fields["product"] != "Keycloak" || recs[1].Fields["title"] != "Keycloak" {
 		t.Errorf("product only: %v", recs[1].Fields)
 	}
 }

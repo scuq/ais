@@ -99,6 +99,31 @@ type finding struct {
 	CVEs, URLs, Devices                                                 []string
 	Title, CVSS, Affected, Action, Published                            string
 	Exploited, PreviouslyReported                                       *bool
+	// Update says what changed since an earlier report; with
+	// PreviouslyReported it turns the block into a short update. IoCs are
+	// indicators of compromise, one per entry.
+	Update string
+	IoCs   []string
+}
+
+// isUpdate reports whether the finding is a short update to an earlier
+// report rather than a new finding.
+func (f finding) isUpdate() bool {
+	return f.PreviouslyReported != nil && *f.PreviouslyReported && strings.TrimSpace(f.Update) != ""
+}
+
+// iocLine renders the indicators as code spans, so that Webex does not
+// make links of them and nobody clicks one by accident.
+func (f finding) iocLine() string {
+	out := make([]string, 0, len(f.IoCs))
+	for i, ioc := range f.IoCs {
+		if i >= 10 {
+			out = append(out, fmt.Sprintf("+%d more", len(f.IoCs)-10))
+			break
+		}
+		out = append(out, "`"+strings.TrimSpace(ioc)+"`")
+	}
+	return strings.Join(out, ", ")
 }
 
 func boolPtr(m map[string]any, k string) *bool {
@@ -155,14 +180,13 @@ func findings(result any) ([]finding, bool) {
 			CVEs: strs(fm, "cve_ids"), URLs: strs(fm, "source_urls"),
 			Title: str(fm, "title"), CVSS: cvss(fm), Affected: str(fm, "affected"), Action: str(fm, "action"),
 			Published: str(fm, "published"), Exploited: boolPtr(fm, "exploited"), PreviouslyReported: boolPtr(fm, "previously_reported"),
+			Update: str(fm, "update"), IoCs: strs(fm, "iocs"),
 		}
 		if devs, ok := fm["devices"].([]any); ok {
 			for _, d := range devs {
 				if dm, ok := d.(map[string]any); ok {
-					if h := str(dm, "hostname"); h != "" {
-						f.Devices = append(f.Devices, h)
-					} else if ip := str(dm, "ip"); ip != "" {
-						f.Devices = append(f.Devices, ip)
+					if name := deviceName(dm); name != "" {
+						f.Devices = append(f.Devices, name)
 					}
 				}
 			}
@@ -182,6 +206,26 @@ func findings(result any) ([]finding, bool) {
 		return oi < oj
 	})
 	return out, true
+}
+
+// deviceName names an attached inventory entry: its hostname, else its
+// address, else its title (a role such as "Internet edge firewalls"), with
+// the install count when the entry stands for more than one.
+func deviceName(dm map[string]any) string {
+	name := str(dm, "hostname")
+	if name == "" {
+		name = str(dm, "ip")
+	}
+	if name == "" {
+		name = str(dm, "title")
+	}
+	if name == "" {
+		return ""
+	}
+	if c := str(dm, "count"); c != "" && c != "1" {
+		name += " (×" + c + ")"
+	}
+	return name
 }
 
 var severityMark = map[string]string{"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢", "unknown": "⚪"}
@@ -245,7 +289,11 @@ func WebexMarkdown(title string, ev Event, maxItems int) string {
 			parts = append(parts, fmt.Sprintf("%d %s", counts[s], s))
 		}
 	}
-	fmt.Fprintf(&b, "%s **%s**: %d finding(s) (%s)\n\n", mark(fs[0].Severity), title, len(fs), strings.Join(parts, ", "))
+	summary := strings.Join(parts, ", ")
+	if n := countUpdates(fs); n > 0 {
+		summary += fmt.Sprintf("; %d update(s)", n)
+	}
+	fmt.Fprintf(&b, "%s **%s**: %d finding(s) (%s)\n\n", mark(fs[0].Severity), title, len(fs), summary)
 	for i, f := range fs {
 		if i >= maxItems {
 			fmt.Fprintf(&b, "… and %d more; see `ais runs show %s --clear`\n\n", len(fs)-maxItems, ev.RunID)
@@ -392,8 +440,47 @@ func (f finding) links() string {
 	return strings.Join(links, " · ")
 }
 
+// countUpdates counts the findings that are updates to earlier reports.
+func countUpdates(fs []finding) int {
+	n := 0
+	for _, f := range fs {
+		if f.isUpdate() {
+			n++
+		}
+	}
+	return n
+}
+
+// updateMarkdown renders a repeated finding as a short update: what is
+// new, the identity and criticality, the fix if there is one, the
+// indicators, the links, and the devices. The rest was reported before.
+func updateMarkdown(f finding) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "🔁 **Update: %s**\n", f.headline())
+	fmt.Fprintf(&b, "**What's new:** %s\n", codeSpans(truncateTo(strings.TrimSpace(f.Update), 400)))
+	fmt.Fprintf(&b, "**CVE:** %s\n", f.cveLine())
+	fmt.Fprintf(&b, "**Criticality:** %s\n", f.criticality())
+	if f.Fixed != "" {
+		fmt.Fprintf(&b, "**New version:** %s\n", f.Fixed)
+	}
+	if len(f.IoCs) > 0 {
+		fmt.Fprintf(&b, "**IoCs:** %s\n", f.iocLine())
+	}
+	if len(f.URLs) > 0 {
+		fmt.Fprintf(&b, "**Links:** %s\n", f.links())
+	}
+	if len(f.Devices) > 0 {
+		fmt.Fprintf(&b, "**Devices (%d):** %s\n", len(f.Devices), joinMax(f.Devices, 5))
+	}
+	return b.String()
+}
+
 // findingMarkdown renders one finding as labelled lines, one fact per line.
+// A repeated finding with an update text is rendered short.
 func findingMarkdown(f finding) string {
+	if f.isUpdate() {
+		return updateMarkdown(f)
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s **%s**\n", mark(f.Severity), f.headline())
 	fmt.Fprintf(&b, "**Your version:** %s\n", f.yourVersion())
@@ -402,6 +489,9 @@ func findingMarkdown(f finding) string {
 	fmt.Fprintf(&b, "**Criticality:** %s\n", f.criticality())
 	if f.Summary != "" {
 		fmt.Fprintf(&b, "**Summary:** %s\n", codeSpans(truncateTo(strings.TrimSpace(f.Summary), 400)))
+	}
+	if len(f.IoCs) > 0 {
+		fmt.Fprintf(&b, "**IoCs:** %s\n", f.iocLine())
 	}
 	if len(f.URLs) > 0 {
 		fmt.Fprintf(&b, "**Links:** %s\n", f.links())
@@ -456,27 +546,43 @@ func WebexCard(title string, ev Event, maxItems int) map[string]any {
 			if color == "" {
 				color = "Default"
 			}
-			body = append(body, map[string]any{"type": "TextBlock", "weight": "Bolder", "color": color, "wrap": true, "text": f.headline()})
+			head := f.headline()
+			if f.isUpdate() {
+				head = "Update: " + head
+			}
+			body = append(body, map[string]any{"type": "TextBlock", "weight": "Bolder", "color": color, "wrap": true, "text": head})
+			if f.isUpdate() {
+				body = append(body, map[string]any{"type": "TextBlock", "text": "What's new: " + truncateTo(strings.TrimSpace(f.Update), 400), "wrap": true})
+			}
 			facts := []any{
-				map[string]any{"title": "Your version", "value": f.yourVersion()},
-				map[string]any{"title": "New version", "value": f.newVersion()},
 				map[string]any{"title": "CVE", "value": f.cveLine()},
 				map[string]any{"title": "Criticality", "value": f.criticality()},
 			}
-			if f.Affected != "" {
+			if !f.isUpdate() {
+				facts = append([]any{
+					map[string]any{"title": "Your version", "value": f.yourVersion()},
+					map[string]any{"title": "New version", "value": f.newVersion()},
+				}, facts...)
+			} else if f.Fixed != "" {
+				facts = append(facts, map[string]any{"title": "New version", "value": f.Fixed})
+			}
+			if len(f.IoCs) > 0 {
+				facts = append(facts, map[string]any{"title": "IoCs", "value": strings.Join(f.IoCs, ", ")})
+			}
+			if f.Affected != "" && !f.isUpdate() {
 				facts = append(facts, map[string]any{"title": "Affected", "value": truncateTo(f.Affected, 300)})
 			}
 			if len(f.Devices) > 0 {
 				facts = append(facts, map[string]any{"title": fmt.Sprintf("Devices (%d)", len(f.Devices)), "value": joinMax(f.Devices, 5)})
 			}
-			if p := f.publishedLine(); p != "" {
+			if p := f.publishedLine(); p != "" && !f.isUpdate() {
 				facts = append(facts, map[string]any{"title": "Published", "value": p})
 			}
 			body = append(body, map[string]any{"type": "FactSet", "facts": facts})
-			if f.Summary != "" {
+			if f.Summary != "" && !f.isUpdate() {
 				body = append(body, map[string]any{"type": "TextBlock", "text": truncateTo(f.Summary, 400), "wrap": true})
 			}
-			if f.Action != "" {
+			if f.Action != "" && !f.isUpdate() {
 				body = append(body, map[string]any{"type": "TextBlock", "text": "Action: " + truncateTo(f.Action, 300), "wrap": true})
 			}
 		}

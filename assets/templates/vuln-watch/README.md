@@ -34,9 +34,13 @@ a gap between runs delays a finding but does not lose it. The times are in `sche
 
 Inputs: an inventory with at least `vendor` and `product`. The default file
 is `~/.config/ais/inventory.mdj`, and the format follows the file extension.
-ais uses `version`, `hostname`, `ip`, `site`, `usage`, `interest`, and
-`comment` when present. A product without device records is an entry without
-`hostname` and `ip`. An entry without `version` is watched for every
+ais uses `version`, `count`, `hostname`, `ip`, `site`, `usage`, `interest`,
+and `comment` when present. An entry can be a role, for example "Internet edge
+firewalls", with `count` for the number of installs it stands for. An entry
+without `count` counts once. `hostname` and `ip` are optional: give them when
+the alert must name the device. The alert names an entry by `hostname`, else
+`ip`, else the heading of the entry. A product without device records is an
+entry without `hostname` and `ip`. An entry without `version` is watched for every
 supported version, and its findings carry `installed_version: unknown`.
 The model uses `usage` to drop findings that need a feature the usage rules
 out. Where an `interest` is given, it reports only matching findings.
@@ -48,5 +52,22 @@ is exploited in the wild is rated `critical`. Each finding has `title`,
 (what is and is not affected), `action` (what an operator must check or do),
 `published`, `source_urls`, `summary`, and `confidence`. The field
 `previously_reported` is true when the finding was in an earlier result and
-is repeated because of new information. Indicator-of-compromise addresses and
-URLs from an advisory go into `summary`.
+is repeated because of new information. Each finding also has `update` and,
+when the advisory lists them, `iocs`. Indicator-of-compromise addresses,
+domains, and URLs go into `iocs` (30 entries at most), not into `summary`.
+
+Update rule: the model reports an earlier finding again only when something
+material changed. The cases are exploitation in the wild, new indicators of
+compromise, a new or changed fixed version, a higher severity or CVSS score,
+and more affected products. Then `previously_reported` is true and `update`
+holds only what is new, in one or two sentences (400 characters at most). For
+a first-time finding, `update` is null.
+
+Closed finding: a finding is closed when the inventory version of the product
+is the fixed version or newer. The model does not report a closed finding. It
+does not report an update for an earlier finding whose product the inventory
+shows as fixed. An upgrade that you record in `inventory.mdj` ends the updates.
+
+The `webex` sink shows a finding with `previously_reported` and an `update`
+as a short update block. To get this in an existing task, install the template
+again with `ais templates use vuln-watch --force`.

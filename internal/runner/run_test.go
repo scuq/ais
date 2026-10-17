@@ -52,7 +52,7 @@ func fixture(t *testing.T) (*Runner, *runtime.Fake, *task.Task) {
 	return r, fake, tk
 }
 
-const okEnvelope = `{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.42,"num_turns":5,"duration_ms":1234,"usage":{"input_tokens":12,"output_tokens":40,"cache_read_input_tokens":500,"cache_creation_input_tokens":100},"modelUsage":{"claude-haiku-5-5":{"inputTokens":1000,"outputTokens":200,"costUSD":0.02},"claude-opus-5-5":{"inputTokens":100,"outputTokens":60,"cacheReadInputTokens":500,"cacheCreationInputTokens":100,"costUSD":0.40}},"structured_output":{"checked":[{"url":"https://example","product":"PAN-OS","verdict":"reported"}],"findings":[{"vendor":"Palo Alto Networks","product":"PAN-OS","affected_version_range":"<11.1.5","installed_version":"11.1.4","fixed_version":"11.1.5","cve_ids":["CVE-2026-1234"],"severity":"critical","source_urls":["https://example"],"summary":"bad","confidence":0.9,"title":"Auth bypass","cvss":9.8,"exploited":true,"affected":"all","action":"upgrade","published":"2026-10-07","previously_reported":false}]}}`
+const okEnvelope = `{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.42,"num_turns":5,"duration_ms":1234,"usage":{"input_tokens":12,"output_tokens":40,"cache_read_input_tokens":500,"cache_creation_input_tokens":100},"modelUsage":{"claude-haiku-5-5":{"inputTokens":1000,"outputTokens":200,"costUSD":0.02},"claude-opus-5-5":{"inputTokens":100,"outputTokens":60,"cacheReadInputTokens":500,"cacheCreationInputTokens":100,"costUSD":0.40}},"structured_output":{"checked":[{"url":"https://example","product":"PAN-OS","verdict":"reported"}],"findings":[{"vendor":"Palo Alto Networks","product":"PAN-OS","affected_version_range":"<11.1.5","installed_version":"11.1.4","fixed_version":"11.1.5","cve_ids":["CVE-2026-1234"],"severity":"critical","source_urls":["https://example"],"summary":"bad","confidence":0.9,"title":"Auth bypass","cvss":9.8,"exploited":true,"affected":"all","action":"upgrade","published":"2026-10-07","previously_reported":false,"update":null}]}}`
 
 func TestRunSucceedsAndEnriches(t *testing.T) {
 	r, fake, tk := fixture(t)
@@ -77,10 +77,10 @@ func TestRunSucceedsAndEnriches(t *testing.T) {
 	clear := out.Clear.(map[string]any)
 	f := clear["findings"].([]any)[0].(map[string]any)
 	devices := f["devices"].([]any)
-	if len(devices) != 2 {
-		t.Fatalf("expected 2 PAN-OS devices attached, got %v", devices)
+	if len(devices) != 1 {
+		t.Fatalf("expected the PAN-OS role entry attached, got %v", devices)
 	}
-	if devices[0].(map[string]any)["hostname"] != "fw01.cyberdyne.systems" {
+	if d := devices[0].(map[string]any); d["title"] != "Internet edge firewalls" || d["count"] != "2" || d["site"] != "earth" {
 		t.Errorf("enrich: %v", devices[0])
 	}
 	// The engine saw the token in env, never in argv.
@@ -111,7 +111,7 @@ func TestRunSucceedsAndEnriches(t *testing.T) {
 		!strings.Contains(pl.Prompt, "interest: Only critical and high findings with an unauthenticated remote attack vector") {
 		t.Errorf("mdj sections not collected into the prompt: %s", pl.Prompt)
 	}
-	if !strings.Contains(pl.Prompt, "- Palo Alto Networks GlobalProtect (no version given) (1 entries)") {
+	if !strings.Contains(pl.Prompt, "- Palo Alto Networks GlobalProtect (no version given) (1 installs)") {
 		t.Errorf("product without a version not in the prompt: %s", pl.Prompt)
 	}
 	ndjson, _ := os.ReadFile(filepath.Join(r.Cfg.RunsDir(), tk.Name, "prompts.ndjson"))
@@ -122,7 +122,7 @@ func TestRunSucceedsAndEnriches(t *testing.T) {
 
 func TestRunLeakBlocksDispatch(t *testing.T) {
 	r, fake, tk := fixture(t)
-	fake.Stdout = strings.Replace(okEnvelope, `"summary":"bad"`, `"summary":"fw01.cyberdyne.systems is bad"`, 1)
+	fake.Stdout = strings.Replace(okEnvelope, `"summary":"bad"`, `"summary":"vpn01.cyberdyne.systems is bad"`, 1)
 	out, err := r.Run(context.Background(), tk, "manual")
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +232,7 @@ func TestPrepareUsesRot13AndCGNAT(t *testing.T) {
 	}
 	var sawHost, sawIP bool
 	for _, rec := range inv.Records {
-		if h := rec.Fields["hostname"]; h == "sj01.ploreqlar.flfgrzf" {
+		if h := rec.Fields["hostname"]; h == "ica01.ploreqlar.flfgrzf" {
 			sawHost = true
 		}
 		if ip := rec.Fields["ip"]; strings.HasPrefix(ip, "100.") {
@@ -266,7 +266,7 @@ func TestPrepareUsesRot13AndCGNAT(t *testing.T) {
 	if !strings.Contains(string(prep.Files["system.md"]), "free-text product list") {
 		t.Error("system prompt lacks the free-text notice")
 	}
-	if prep.Map.Tokens["sj01.ploreqlar.ploreqlar"] != "" && prep.Map.Tokens["sj01.ploreqlar.flfgrzf"] != "fw01.cyberdyne.systems" {
+	if prep.Map.Tokens["ica01.ploreqlar.flfgrzf"] != "vpn01.cyberdyne.systems" {
 		t.Errorf("map does not resolve the rot13 token: %v", prep.Map.Tokens)
 	}
 	var rules map[string]any

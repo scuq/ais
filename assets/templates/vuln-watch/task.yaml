@@ -26,6 +26,8 @@ inventory:
 
 # Field policy. Unknown columns are dropped.
 fields:
+  title: scrub                  # mdj heading: a role, or a hostname
+  count: clear                  # installs an entry stands for
   hostname: pseudonym
   ip: pseudonym
   site: pseudonym
@@ -114,9 +116,9 @@ prompt: |
   a feature the usage rules out. When a product has an interest, report only findings that match it.
   Where a product gives no version, treat every currently supported version as in use and set
   installed_version to "unknown".
-  When an advisory lists indicator-of-compromise IPs or URLs, put them in the summary, so that an
-  operator can block them.
-  {{ range .Groups }}- {{ .Fields.vendor }} {{ .Fields.product }} {{ with .Fields.version }}{{ . }}{{ else }}(no version given){{ end }} ({{ .Count }} entries){{ with index .Collected "usage" }}; usage: {{ join . "; " }}{{ end }}{{ with index .Collected "interest" }}; interest: {{ join . "; " }}{{ end }}{{ with index .Collected "comment" }}; notes: {{ join . "; " }}{{ end }}
+  Put indicator-of-compromise IP addresses, domains and URLs in iocs, one per entry, so that an
+  operator can block them; do not list them in the summary.
+  {{ range .Groups }}- {{ .Fields.vendor }} {{ .Fields.product }} {{ with .Fields.version }}{{ . }}{{ else }}(no version given){{ end }} ({{ .Count }} installs){{ with index .Collected "usage" }}; usage: {{ join . "; " }}{{ end }}{{ with index .Collected "interest" }}; interest: {{ join . "; " }}{{ end }}{{ with index .Collected "comment" }}; notes: {{ join . "; " }}{{ end }}
   {{ end }}{{ if .Text }}Free-text product list, without device records. Where a line gives no version, treat every
   currently supported version as in use and set installed_version to "unknown":
   {{ range .Text }}- {{ . }}
@@ -124,11 +126,18 @@ prompt: |
   Start with mcp__inventory__results_recent (limit 20). Each earlier result has findings (reported) and
   checked (advisories and news items that an earlier run already evaluated, with the verdict). Skip an item
   whose URL is in an earlier checked list or finding, unless the source shows an update after that run
-  finished; then check it again. Do not report a finding again unless new information appeared.
-  Set previously_reported to true when the finding was in an earlier result and you report it again because of new information.
+  finished; then check it again.
+  Report a finding that an earlier run reported again only when something material changed: it is now
+  exploited in the wild, new indicators of compromise appeared, a fixed version became available or
+  changed, the severity or CVSS rose, or the advisory now names more affected products. Then set
+  previously_reported to true and write in update only what is new, in one or two sentences; fill the
+  other fields as usual. A first-time finding has update null.
+  A finding is closed when the inventory version of the product is the fixed version or newer. Compare
+  the fixed version with the versions in the list above before you report; do not report a closed finding,
+  and do not report an update for an earlier finding whose product the inventory shows as fixed.
   In checked, list every advisory or news item that you evaluated in this run, reported or dropped, with
   its URL, the product it concerns, and a short verdict (for example "reported", "version not affected",
-  "medium severity", "product not in inventory"). Do not repeat items that you skipped because an earlier
+  "medium severity", "product not in inventory", "fixed in inventory", "reported (update)"). Do not repeat items that you skipped because an earlier
   run checked them.
   For each finding fill title (one line, what the flaw is), cvss (base score, null when none is published),
   exploited (true only when a source reports exploitation in the wild), affected (which products, models or
@@ -163,7 +172,7 @@ outputSchema:
       items:
         type: object
         required: [product, title, affected_version_range, installed_version, cve_ids, severity, cvss, exploited,
-                   source_urls, summary, affected, action, published, previously_reported, confidence]
+                   source_urls, summary, affected, action, published, previously_reported, update, confidence]
         additionalProperties: false
         properties:
           vendor: { type: string }
@@ -184,13 +193,18 @@ outputSchema:
           action: { type: string, maxLength: 600 }
           published: { type: string, maxLength: 120 }
           previously_reported: { type: boolean }
+          update: { type: [string, "null"], maxLength: 400 }
+          iocs:
+            type: array
+            maxItems: 30
+            items: { type: string, maxLength: 200 }
           confidence: { type: number, minimum: 0, maximum: 1 }
 
 # Host-side join after the run: attach device identity the model never saw.
 enrich:
   - path: findings
     match: { product: product, installed_version: version }
-    attach: { devices: [hostname, ip, site] }
+    attach: { devices: [title, count, hostname, ip, site] }
 
 # Daily summary when a day passes without a finding: how many runs, turns,
 # tokens and dollars it took. It goes to the sinks below at 22:30, after the

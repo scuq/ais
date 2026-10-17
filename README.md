@@ -29,6 +29,7 @@
     aisctl redact test | approve
     aisctl prompts [list [--task T] [-n N]] | show <run-id> | last [--task T]
     aisctl templates list | show NAME | use NAME [--as NAME] [--force]
+    aisctl inventory list | show | set | add | rm | apply FILE | import panorama FILE [--file PATH]
 
 ## Description
 
@@ -319,7 +320,21 @@ An inventory is a flat list of records. A CSV file has a header row. A YAML or J
 ais reads every value as a string.
 The example inventory `assets/examples/inventory.mdj` has a `usage` and an `interest` field. Use the mode `scrub` for such a field.
 
-The format `mdj` (markdown with JSON) is the format for people to write. Each system or product has one level 1 heading, one JSON block, and optional free-text sections:
+The format `mdj` (markdown with JSON) is the format for people to write. Each role, system, or product has one level 1 heading, one JSON block, and optional free-text sections.
+An entry need not be a device. It can be a role, for example `Internet edge firewalls`, with the field `count` for the number of installs that it stands for:
+
+    # Internet edge firewalls
+
+    ```json
+    {"vendor": "Palo Alto Networks", "product": "PAN-OS", "version": "11.1.4",
+     "count": 2, "site": "earth"}
+    ```
+
+    ## Usage
+
+    Edge firewalls, internet facing. No GlobalProtect VPN.
+
+An entry for one device has a `hostname` and an `ip`:
 
     # fw01.cyberdyne.systems
 
@@ -344,7 +359,10 @@ These rules apply to an `mdj` file:
   The values are flat: no nested object and no array. A number or a boolean becomes a string.
 - Each level 2 heading starts a free-text field. The name of the field is the heading in lowercase, with each run of characters that are not letters or digits changed to `_`. The heading `Owner Notes` gives `owner_notes`.
 - The text of a field has single spaces. Level 3 and lower headings and code blocks inside a section are part of the text.
-- The text of the level 1 heading is a label. It is not a field.
+- The text of the level 1 heading is the field `title` of the records view. If the JSON block sets `title`, that value applies.
+- `hostname` and `ip` are optional for each entry. Give them when the alert must name the device. Leave them out when the role is enough. The file then holds fewer addresses.
+- `count` is a positive integer. It is the number of installs that the entry stands for. An entry without `count` counts once. The prompt groups entries and adds their counts, for example `(3 installs)`.
+- `count` is a reserved field. The field policy always keeps it clear. A task that uses `count` in `enrich` must still list `count: clear` in `fields`.
 - A product without device records has no `hostname` and no `ip`. If it has no `version`, ais watches every supported version.
 
 ais stops with an error and a line number in these cases:
@@ -365,6 +383,146 @@ A line has 300 characters at most, and the file has 500 lines at most.
 The model gets each line through the prompt and through `inventory_products`.
 If `inventory.textFile` names a file that does not exist, the run fails. Create the file or remove the key.
 In new setups, use an `mdj` entry without `hostname`, `ip`, and `version` instead.
+An inventory from an earlier version works without a change.
+
+### Maintaining the inventory
+
+`aisctl inventory` changes `inventory.mdj` without an editor. It also shows the file without real addresses. A person, or a model that helps a person, then never needs to open the file.
+Every command takes `--file PATH`. Without it, the command uses `inventory.file` of `config.yaml`, and then `~/.config/ais/inventory.mdj`.
+
+| Command | Meaning |
+|---|---|
+| `aisctl inventory list` | Print a table with TITLE, VENDOR, PRODUCT, VERSION, COUNT, HOSTNAME, IP, and SECTIONS. Hostnames and addresses are pseudonyms from the redaction policy of the host (by default `rot13` and `cgnat`). Each call uses a new key. |
+| `aisctl inventory show` | Print the whole file with pseudonyms for titles, values, and section text. Write the pseudonym map to `<state dir>/inventory.redact-map.json` (mode 0600). A note on standard error names the map. The command stops if a hostname or an address in the JSON fields is outside `pii.domains` and `pii.cidrs`, because it would print in clear. `--force` prints anyway. |
+| `aisctl inventory apply FILE` | Take an edited copy of the `show` output. Restore the real values from the map, check the `mdj` syntax, and write the inventory file. A pseudonym that the map does not know stays as written, so new entries work. The command fails if the map does not exist. |
+| `aisctl inventory set TITLE [key=value ...]` | Change one entry. The title match ignores case. `--usage TEXT` and `--interest TEXT` set these sections. `--section Heading=Text` sets another section. `--unset key` removes a JSON key. `--section` and `--unset` can repeat. `count` must be a positive integer. The command refuses a key that is a section of the entry, and a section that repeats a JSON key. |
+| `aisctl inventory add TITLE key=value ...` | Add an entry. It takes at least one `key=value`, and the options `--usage`, `--interest`, and `--section`. It fails if the title exists. It creates the file if the file does not exist. |
+| `aisctl inventory set --where FIELD~REGEX [key=value ...]` | The same change for every entry whose field matches the regular expression. `--where` can repeat; every condition must match. `title` selects on the heading, and a section name such as `usage` selects on its text. Prefix the expression with `(?i)` to ignore case. No match is an error. `--dry-run` lists the entries, with pseudonymized titles, and writes nothing. Example: `aisctl inventory set --where 'hostname~^fw' --usage "Edge firewall."` |
+| `aisctl inventory rm TITLE` | Remove one entry. |
+| `aisctl inventory rm --where FIELD~REGEX` | Remove every entry that matches. `--dry-run` lists them. |
+| `aisctl inventory import panorama FILE` | Merge a Panorama export. See the next subsection. `--prune` and `--dry-run` are options. |
+
+Every command that writes first makes a backup, `<file>.bak-<timestamp>`. A second backup in the same second gets the suffix `-1`, then `-2`.
+The command then writes the file again from the parsed structure. JSON values become strings, the key order stays, and sections stay as written.
+If `config.yaml` exists, the command also runs the redaction coverage check. It prints that every hostname and address is covered, or how many are not.
+`set`, `add`, `rm`, and `apply` do not need the daemon. ais reads the inventory at the start of each run.
+
+The recommended workflow:
+
+1. Run `list` to see what the inventory holds.
+2. Use `set`, `add`, and `rm` for routine changes, such as versions, counts, and usage text.
+3. For a larger rewrite, run `show`, edit the redacted copy, and run `apply`.
+4. For firewalls, run `import panorama`.
+
+NOTE: This keeps real addresses away from a model that you ask to help. It does not stop a program with shell access on the host from reading the real file.
+
+#### Examples
+
+See what the inventory holds, without real addresses:
+
+```
+aisctl inventory list
+```
+
+Hostnames and addresses appear as pseudonyms: `rot13` names and addresses in `100.64.0.0/10`. The output can go into a chat with a model.
+
+A firewall got an upgrade:
+
+```
+aisctl inventory set "Internet edge firewalls" version=11.1.6
+```
+
+The command makes the backup `<file>.bak-<timestamp>` and writes the new version. The next run uses it. No reload is necessary.
+
+Watch a new product that has no device records:
+
+```
+aisctl inventory add "Grafana" vendor=Grafana product=Grafana --interest "Unauthenticated remote attack vectors only."
+```
+
+The entry has no version, so ais watches every supported version.
+
+Add a device that alerts must name:
+
+```
+aisctl inventory add "db01.cyberdyne.systems" hostname=db01.cyberdyne.systems ip=10.1.0.20 site=earth vendor=PostgreSQL product=PostgreSQL version=16.4 --usage "Internal only."
+```
+
+After the write, the command prints a coverage line. It says that the redaction policy covers every hostname and address, or how many are outside it. If a value is not covered, run `aisctl redact test`. Then fix `pii.domains` or `pii.cidrs`.
+
+Give the same text to many entries. First list the entries that match:
+
+```
+aisctl inventory set --where 'hostname~^fw' --usage "Internet edge firewall. Management interface behind a firewall." --dry-run
+aisctl inventory set --where 'hostname~^fw' --usage "Internet edge firewall. Management interface behind a firewall."
+```
+
+The second command changes every entry whose `hostname` starts with `fw`. You can also select on another field:
+
+```
+aisctl inventory set --where 'product~^PAN-OS$' --interest "Critical and high, unauthenticated remote attack vector."
+```
+
+Start the expression with `(?i)` to ignore case. If no entry matches, the command fails and changes nothing.
+
+Add a role instead of devices:
+
+```
+aisctl inventory add "Core switches" vendor=Cisco product="IOS XE" version=17.9.5 count=4 site=venus --usage "Core switches, internal only. Web UI disabled."
+```
+
+The prompt shows `count` as the number of installs. In the `webex` sink, alerts name the role with `(×4)`.
+
+Retire one entry, or many:
+
+```
+aisctl inventory rm "Grafana"
+aisctl inventory rm --where 'version~^10\.' --dry-run
+aisctl inventory rm --where 'version~^10\.'
+```
+
+The second command lists the entries that match and removes none. The third command removes them.
+
+Rewrite a large part of the inventory with the help of a model:
+
+```
+aisctl inventory show > draft.mdj
+# Give draft.mdj to the model. Nothing in it is real.
+# Edit the file, then write it back.
+aisctl inventory apply draft.mdj
+```
+
+If an address in the free text is outside `pii.cidrs`, `show` stops, because the address would print in clear. The command `apply` restores the real values from the map in the state directory. It checks the syntax before it writes.
+
+Keep the firewall counts current from Panorama:
+
+```
+aisctl inventory import panorama managed-devices.csv --roles --dry-run
+aisctl inventory import panorama managed-devices.csv --roles
+aisctl inventory import panorama managed-devices.csv --roles --prune
+```
+
+The first command prints the table of models and versions and writes nothing. The second command writes one entry for each version. Use the third command after upgrades, to remove versions that the export no longer has. The usage and interest sections of the version entries stay after a new import. To get a named entry for each device, import without `--roles`.
+
+#### Panorama import
+
+`aisctl inventory import panorama FILE` reads a Panorama `Managed Devices` CSV export. The example `assets/examples/panorama-managed-devices.csv` shows the format.
+The file has a header row, and the columns can be in any order. The columns `Device Name` and `Software Version` must exist. The command also uses `Serial Number`, `Model`, `IP Address IPv4`, `IP Address IPv6`, and `HA Cluster State`.
+A device with several virtual systems appears once. An HA pair is one row in the export, with `;` between the two names, serial numbers, addresses, and states; the command splits it into two devices, and a column with one value, such as the model, applies to both. No model is involved.
+
+Each device becomes an entry. The title is the device name. The JSON block has `hostname`, `ip`, `ipv6`, `vendor` (`Palo Alto Networks`), `product` (`PAN-OS`), `version`, `model`, `serial`, `ha_state`, and `source: panorama`.
+The merge follows these rules:
+
+- A device matches an existing entry by `serial`. If there is no match, it matches by `hostname`, and then by title.
+- A matched entry gets the imported values. It keeps its other values, for example `site`, and its sections.
+- `vendor` and `product` are set only if the entry has none.
+- An IP address that the export no longer has is removed.
+- A new device is appended.
+- With `--prune`, the command removes entries with `source: panorama` that the export no longer has. Hand-written entries stay.
+- With `--dry-run`, the command writes nothing.
+- With `--roles`, the command writes no device. It makes one entry per software version, titled `PAN-OS <version>`, with `vendor`, `product`, `version`, `count` (the number of devices), `models` (the device models), and `source: panorama`, and no hostname or address. A new import moves the counts. With `--prune`, it removes entries with `source: panorama` whose version the export no longer has. It never changes an entry without `source: panorama`, so your role entries with usage and interest text stay.
+
+The command always prints a table with MODEL, VERSION, and DEVICES, without identities. It also prints the counts added, updated, unchanged, and pruned.
 
 ais reads the inventory file (and the free-text file, if you set one) at the start of each run. A change to these files applies to the next run. A reload or a restart of the daemon is not necessary.
 If a change adds a hostname or an address outside `pii.domains` or `pii.cidrs`, run `aisctl redact test`. The daemon does not check the coverage of the inventory at the start of a run.
@@ -432,14 +590,19 @@ A finding block has one labelled line for each fact:
 | Summary | The summary, 400 characters at most. A URL or an IPv4 address is a code span. |
 | Links | Up to 3 source links, each named after its host. |
 | Affected | Which products and configurations are affected, 300 characters at most. |
-| Devices | Up to 5 device names with a count. |
+| Devices | Up to 5 attached entries. The name is the `hostname`, else the `ip`, else the `title`. If `count` is more than 1, the name has ` (×N)`. |
 | Action | What an operator must check or do, 300 characters at most. |
 | Published | The publication date, and if the finding is new to this watch. |
 
 A line whose fact is missing from the finding is not shown, except the first five lines.
 
+If the finding has `iocs`, an `IoCs` line follows the summary. Each indicator is a code span.
+
+A finding with `previously_reported: true` and a non-empty `update` is an update. An update block is short. Its headline starts with `🔁 **Update:`, and its first line is `What's new` with the text of `update`. It has the lines CVE, Criticality, New version (only if there is a fixed version), IoCs (up to 10), Links, and Devices. It has no Your version, Summary, Affected, Action, or Published line, because the earlier report gave them. The message headline counts the updates, for example `2 finding(s) (1 critical, 1 high; 1 update(s))`. The sink renders a repeated finding without `update` text in full, with the line "Previously reported in this watch; new information."
+
 ais truncates a message to 7000 characters. If a result has no findings, the message is a line with a green check mark. To send nothing in this case, set `skipEmpty: true` on the sink. An alert event gives a warning line with the reason, the error, and the names of the leaked fields. A result without a `findings` array is sent as a JSON code block.
 With `card: true`, the message also has an Adaptive Card (version 1.3) with the same content and up to 3 `Action.OpenUrl` buttons.
+The card handles an update in the same way. The headline starts with `Update: `, a `What's new` text replaces the summary, and the card has an IoCs fact.
 
 ### Digest
 
@@ -513,7 +676,7 @@ To change top-level keys without an editor, use `ais tasks set`.
 | `inventory.file` | `inventory.file` | Inventory file for this task. |
 | `inventory.format` | `auto` | Format of that file. |
 | `inventory.textFile` | `inventory.textFile` | Free-text inventory for this task. The shipped templates do not set it. The template `{{ .Text }}` gives its lines. |
-| `fields` | none | Map from inventory column to `clear`, `pseudonym`, `scrub`, or `drop`. A column that is not listed is dropped. |
+| `fields` | none | Map from inventory column to `clear`, `pseudonym`, `scrub`, or `drop`. A column that is not listed is dropped. The column `count` is always `clear`. `title` is a column of the `mdj` records view. |
 | `expose.prompt.groupBy` | none | List of columns. The prompt gets the distinct combinations of these columns and a count. Each column must be `clear`. |
 | `expose.prompt.collect` | none | List of columns, for example `[comment]`. For each group, the prompt gets the distinct values of these columns, at most 20. Each column must be `clear` or `scrub`. |
 | `expose.mcp.tools` | all three | Subset of `inventory_products`, `inventory_list`, and `results_recent`. |
@@ -560,6 +723,7 @@ Each rule has three keys:
 - `attach` maps a new result field to a list of inventory columns. Each column must appear in `fields`.
 
 The new field holds a list with one object for each inventory record that matches. The list can be empty.
+To attach `count`, list `count: clear` in `fields`. The template `vuln-watch` attaches `[title, count, hostname, ip, site]`.
 
 ## Commands
 
@@ -615,6 +779,7 @@ The new field holds a list with one object for each inventory record that matche
 |---|---|
 | `aisctl init` | Do the complete setup. See Quickstart. It does not start the daemon until you approve the redaction policy. |
 | `aisctl redact test` | Print the redaction policy and its hash. Run samples through the policy, and list inventory values that it does not cover. `--text T` adds your text. `--stdin` adds text from standard input. `--inventory FILE` uses another inventory, and `--format csv\|json\|yaml\|mdj` sets its format. `--task NAME` applies the `fields` of that task. Without it, a policy based on the column names applies. This policy scrubs fields named `usage` or `interest`, and fields with `descr`, `comment`, `note`, or `remark` in the name. `--json` prints the report as JSON. The report shows every record before and after redaction. |
+| `aisctl inventory ...` | Maintain the inventory file. See Maintaining the inventory. |
 | `aisctl redact approve` | Run the test, and write `pii.approvedHash` to `config.yaml`. It stops if inventory values are not covered, unless you give `--force`. Then it starts the unit if the unit is enabled and not running, or sends SIGHUP if the unit is running. The new policy applies to the next run. `--no-start` skips this last step. |
 | `aisctl prompts list` | List the logged prompts from `prompts.ndjson`, newest first, with dry runs. `--task T` and `-n N` limit the list. `aisctl prompts` alone does the same. |
 | `aisctl prompts last` | Show the newest prompt. `--task T` limits it to one task. |

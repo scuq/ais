@@ -550,11 +550,18 @@ func installFile(src, dst string, mode os.FileMode) error {
 	return os.Rename(tmp, dst)
 }
 
+// backup moves the file aside under a timestamped name. A second backup in
+// the same second gets a numeric suffix, so none is lost.
 func backup(path string) {
 	if !fileExists(path) {
 		return
 	}
-	_ = os.Rename(path, path+".bak-"+time.Now().UTC().Format("20060102T150405Z"))
+	base := path + ".bak-" + time.Now().UTC().Format("20060102T150405Z")
+	dst := base
+	for i := 1; fileExists(dst); i++ {
+		dst = fmt.Sprintf("%s-%d", base, i)
+	}
+	_ = os.Rename(path, dst)
 }
 
 func fileExists(path string) bool {

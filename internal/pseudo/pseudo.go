@@ -235,6 +235,12 @@ func Apply(p Policy, t *Tokenizer, m *Map, rd *Redactor, recs []inventory.Record
 				if rd != nil {
 					nr.Fields[f] = rd.Redact(v)
 				}
+			default:
+				// The install count of an entry is a number, never an
+				// identity; it stays so that the grouping can add it.
+				if f == inventory.CountField {
+					nr.Fields[f] = v
+				}
 			}
 		}
 		out = append(out, nr)

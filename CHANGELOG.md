@@ -3,6 +3,23 @@
 All notable changes to this project are in this file.
 The format follows Keep a Changelog.
 
+## [0.5.0] - 2026-10-17
+
+### Added
+
+- The command `aisctl inventory` maintains `inventory.mdj` without an editor. The subcommands are `list`, `show`, `set`, `add`, `rm`, `apply`, and `import panorama`. `list` and `show` pseudonymize hostnames and addresses, so a person or a model that helps them does not see real values. `set --where FIELD~REGEX` and `rm --where FIELD~REGEX` apply a change to every entry whose field matches a regular expression; `--dry-run` lists the entries first. `show` writes the pseudonym map to `inventory.redact-map.json` in the state directory, and `apply` uses it. Each write makes a backup `<file>.bak-<timestamp>`.
+- The command `aisctl inventory import panorama FILE` merges a Panorama `Managed Devices` CSV export into the inventory. A device matches an entry by `serial`, `hostname`, or title. An HA pair, one row with `;` between the peers, becomes two devices. With `--roles`, the command writes one entry per software version with a `count` and no hostname or address. The other options are `--prune` and `--dry-run`. The export can have a UTF-8 byte order mark or UTF-16 encoding. The example export is `assets/examples/panorama-managed-devices.csv`.
+- An `mdj` entry can be a role, for example `Internet edge firewalls`, with the field `count`. `count` is a positive integer for the number of installs. `hostname` and `ip` are optional for each entry. The records view has the new field `title`, the heading of the entry, unless the JSON block sets `title`.
+- The template `vuln-watch` has two finding fields. The field `update` is required: a string of 400 characters at most, or null for a first-time finding. The field `iocs` is optional: up to 30 indicator-of-compromise IP addresses, domains, and URLs, one for each entry, 200 characters at most each.
+
+### Changed
+
+- The prompt of the template `vuln-watch` says `(N installs)` and not `(N entries)`. The grouping adds the `count` of each entry, and an entry without `count` counts once. The template lists `title: scrub` and `count: clear` in `fields`, and the `enrich` rule attaches `[title, count, hostname, ip, site]`. A task that uses `count` in `enrich` must list `count: clear` in `fields`. The field policy always keeps `count` clear. An existing inventory and an existing task work without a change.
+- The `webex` sink names an attached entry by `hostname`, else `ip`, else `title`. If `count` is more than 1, the name has ` (×N)`.
+- The example `assets/examples/inventory.mdj` uses role entries with `count`.
+- The template `vuln-watch` reports an earlier finding again only when something material changed: exploitation in the wild, new indicators of compromise, a new or changed fixed version, a higher severity or CVSS score, or more affected products. Then `previously_reported` is true and `update` holds only what is new. The model does not report a finding when the inventory version of the product is the fixed version or newer. An upgrade in `inventory.mdj` ends the updates. The model puts indicators of compromise in `iocs` and not in `summary`. To get this in an existing task, install the template again with `ais templates use vuln-watch --force`. You can also copy the prompt sentences and the two schema fields. A task without `update` in its schema works as before.
+- The `webex` sink shows a finding with `previously_reported: true` and a non-empty `update` as a short update block. The block starts with `Update:` and `What's new`. It has no Your version, Summary, Affected, Action, or Published line. The message headline counts the updates. The sink renders a repeated finding without `update` text in full. A full finding block has an `IoCs` line when the finding has `iocs`. The Adaptive Card follows the same rules.
+
 ## [0.4.0] - 2026-10-17
 
 ### Added

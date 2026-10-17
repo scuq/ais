@@ -414,3 +414,54 @@ func TestSkipEmpty(t *testing.T) {
 		}
 	}
 }
+
+func TestWebexUpdateAndIoCs(t *testing.T) {
+	ev := Event{Kind: "result", Task: "vuln-watch", RunID: "r1", State: "succeeded", FinishedAt: time.Now(),
+		Result: map[string]any{"findings": []any{
+			map[string]any{"vendor": "Palo Alto Networks", "product": "PAN-OS", "title": "Management interface root RCE", "cve_ids": []any{"CVE-2026-0322"},
+				"severity": "critical", "cvss": 8.6, "exploited": true, "fixed_version": "11.2.13-h3", "installed_version": "11.2.13-h2",
+				"summary": "Long summary that an update must not repeat.", "affected": "All PA-Series.", "action": "Patch now.",
+				"published": "2026-10-14; updated 2026-10-16", "previously_reported": true,
+				"update":      "Now exploited in the wild; CISA KEV entry added. Three new attacker addresses published.",
+				"iocs":        []any{"66.42.72.14", "208.83.239.114", "evil.example"},
+				"source_urls": []any{"https://security.paloaltonetworks.com/CVE-2026-0322"},
+				"devices":     []any{map[string]any{"hostname": "fw01.example"}}},
+			map[string]any{"vendor": "Fortinet", "product": "FortiOS", "title": "SSL VPN flaw", "cve_ids": []any{"CVE-2026-0002"}, "severity": "high",
+				"source_urls": []any{"https://fortiguard.fortinet.com/"}, "summary": "New finding.", "previously_reported": false, "update": nil,
+				"iocs": []any{"203.0.113.9"}},
+		}}}
+	md := WebexMarkdown("ais vuln-watch", ev, 10)
+	for _, want := range []string{
+		"🔴 **ais vuln-watch**: 2 finding(s) (1 critical, 1 high; 1 update(s))",
+		"🔁 **Update: Palo Alto Networks PAN-OS — Management interface root RCE**",
+		"**What's new:** Now exploited in the wild; CISA KEV entry added.",
+		"**Criticality:** CRITICAL / CVSS 8.6 / Exploited in the wild",
+		"**New version:** 11.2.13-h3",
+		"**IoCs:** `66.42.72.14`, `208.83.239.114`, `evil.example`",
+		"**Devices (1):** fw01.example",
+		"🟠 **Fortinet FortiOS — SSL VPN flaw**",
+		"**Summary:** New finding.",
+		"**IoCs:** `203.0.113.9`",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("markdown missing %q:\n%s", want, md)
+		}
+	}
+	for _, unwanted := range []string{"Long summary", "**Affected:** All PA-Series", "**Action:** Patch now", "**Your version:** 11.2.13-h2", "Previously reported in this watch"} {
+		if strings.Contains(md, unwanted) {
+			t.Errorf("update repeats %q:\n%s", unwanted, md)
+		}
+	}
+	// A repeated finding without an update text is rendered in full.
+	full := ev.Result.(map[string]any)["findings"].([]any)[0].(map[string]any)
+	full["update"] = ""
+	if md := WebexMarkdown("ais vuln-watch", ev, 10); !strings.Contains(md, "**Your version:** 11.2.13-h2") || !strings.Contains(md, "Previously reported in this watch; new information.") {
+		t.Errorf("fallback to full block missing:\n%s", md)
+	}
+	full["update"] = "x"
+	card := WebexCard("ais vuln-watch", ev, 10)
+	raw, _ := json.Marshal(card)
+	if !strings.Contains(string(raw), "Update: Palo Alto Networks PAN-OS") || !strings.Contains(string(raw), "What's new: x") || strings.Contains(string(raw), "Long summary") {
+		t.Errorf("card: %s", raw)
+	}
+}
