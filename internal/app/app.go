@@ -46,6 +46,9 @@ COMMANDS
     digest <task>     Send the summary of the last window (runs, turns, tokens,
                       cost) to the task's sinks now; --print shows it, --window D
                       sets the window (default: the task's digest.window, 24h)
+    feeds <sub>       test [--items] <task>: read the feeds and show what is new,
+                      claiming nothing; seen <task>: mark every current item as
+                      seen, so the feed checks start from now
     hook redact       PostToolUse hook (runs inside the container)
     config show       Print the resolved configuration (--json for JSON)
     doctor            Check the engine and host
@@ -87,6 +90,8 @@ func Main(args []string) int {
 		err = cmdSinks(ctx, p, args[1:])
 	case "digest":
 		err = cmdDigest(ctx, p, args[1:])
+	case "feeds":
+		err = cmdFeeds(ctx, p, args[1:])
 	case "run":
 		return cmdRun(ctx, p, args[1:])
 	case "hook":

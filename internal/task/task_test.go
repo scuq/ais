@@ -110,3 +110,33 @@ func TestDigestKey(t *testing.T) {
 		}
 	}
 }
+
+func TestFeedsKey(t *testing.T) {
+	tk := mustParse(t, minimal+"feeds: {urls: [https://a.example/rss], fullSchedule: \"7 20 * * *\"}\n")
+	if tk.Feeds == nil || tk.Feeds.MaxItems != DefaultFeedMaxItems || tk.Feeds.Timeout != 30*time.Second || !tk.Feeds.Quiet() || tk.Feeds.MaxAge != DefaultFeedMaxAge || tk.Feeds.RunCap() != DefaultFeedMaxRunsPerDay {
+		t.Errorf("feeds defaults: %+v", tk.Feeds)
+	}
+	tk = mustParse(t, minimal+"feeds: {urls: [https://a.example/rss], maxItems: 5, skipWhenQuiet: false, timeout: 5s}\n")
+	zero := mustParse(t, minimal+"feeds: {urls: [https://a.example/rss], maxRunsPerDay: 0}\n")
+	if zero.Feeds.RunCap() != 0 {
+		t.Errorf("explicit 0 must mean no cap: %d", zero.Feeds.RunCap())
+	}
+	if tk.Feeds.MaxItems != 5 || tk.Feeds.Quiet() || tk.Feeds.Timeout != 5*time.Second {
+		t.Errorf("feeds: %+v", tk.Feeds)
+	}
+	for name, doc := range map[string]string{
+		"no urls":      minimal + "feeds: {fullSchedule: \"@daily\"}\n",
+		"not http":     minimal + "feeds: {urls: [ftp://a.example/x]}\n",
+		"bad cron":     minimal + "feeds: {urls: [https://a.example/rss], fullSchedule: \"99 * * * *\"}\n",
+		"bad maxItems": minimal + "feeds: {urls: [https://a.example/rss], maxItems: -1}\n",
+		"bad cap":      minimal + "feeds: {urls: [https://a.example/rss], maxRunsPerDay: -1}\n",
+	} {
+		tk, err := Parse([]byte(doc), defs)
+		if err == nil {
+			err = tk.Validate()
+		}
+		if err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

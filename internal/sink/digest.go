@@ -23,9 +23,11 @@ type Digest struct {
 	Runs        int       `json:"runs"`
 	Succeeded   int       `json:"succeeded"`
 	// Failed counts failed, leaked and timed-out runs; Skipped counts
-	// overlap skips and cancellations.
+	// overlap skips and cancellations; Quiet counts feed checks that found
+	// nothing new and started no container.
 	Failed   int `json:"failed"`
 	Skipped  int `json:"skipped"`
+	Quiet    int `json:"quiet"`
 	Findings int `json:"findings"`
 	// Checked is the number of items in the checked lists of the results,
 	// when the task's output has such a list (vuln-watch does).
@@ -67,7 +69,11 @@ func BuildDigest(ctx context.Context, st *store.Store, taskName string, p Digest
 		case store.StateSucceeded:
 			dg.Succeeded++
 		case store.StateSkipped, store.StateCancelled:
-			dg.Skipped++
+			if r.Reason == "quiet" {
+				dg.Quiet++
+			} else {
+				dg.Skipped++
+			}
 		default:
 			dg.Failed++
 		}
@@ -205,6 +211,9 @@ func (dg Digest) RunsLine() string {
 	}
 	if dg.Skipped > 0 {
 		parts = append(parts, fmt.Sprintf("%d skipped", dg.Skipped))
+	}
+	if dg.Quiet > 0 {
+		parts = append(parts, fmt.Sprintf("%d quiet", dg.Quiet))
 	}
 	line := fmt.Sprintf("%d run(s)", dg.Runs)
 	if len(parts) > 0 {

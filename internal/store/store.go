@@ -135,6 +135,19 @@ CREATE TABLE IF NOT EXISTS prompts (
 );
 CREATE INDEX IF NOT EXISTS prompts_task_created ON prompts(task, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS feed_items (
+  task TEXT NOT NULL,
+  key TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  link TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  published TEXT NOT NULL DEFAULT '',
+  first_seen TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'new',
+  run_id TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (task, key)
+);
+CREATE INDEX IF NOT EXISTS feed_items_state ON feed_items(task, state);
 CREATE TABLE IF NOT EXISTS deliveries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -159,6 +172,7 @@ var runColumnsAdded = []struct{ name, def string }{
 	{"cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"},
 	{"cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"},
 	{"models", "TEXT NOT NULL DEFAULT ''"},
+	{"mode", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // deliveryColumnsAdded lists the columns added to deliveries after the
@@ -267,6 +281,9 @@ type Run struct {
 	// auth, schema, budget, turns, overlap, exit, engine, timeout.
 	Reason string `json:"reason"`
 	Error  string `json:"error"`
+	// Mode is "feed" for a feed check and "full" for the complete check;
+	// empty for rows from before feed checks existed.
+	Mode string `json:"mode,omitempty"`
 }
 
 // Terminal reports whether the state is final.
@@ -280,9 +297,9 @@ func Terminal(state string) bool {
 
 // InsertRun records a new run.
 func (s *Store) InsertRun(ctx context.Context, r Run) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO runs (id, task, task_hash, state, trigger, engine, dir, started_at, model, reason)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.Task, r.TaskHash, r.State, r.Trigger, r.Engine, r.Dir, ts(r.StartedAt), r.Model, r.Reason)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO runs (id, task, task_hash, state, trigger, engine, dir, started_at, model, reason, mode)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.Task, r.TaskHash, r.State, r.Trigger, r.Engine, r.Dir, ts(r.StartedAt), r.Model, r.Reason, r.Mode)
 	return err
 }
 
@@ -312,13 +329,13 @@ func (s *Store) SetRunState(ctx context.Context, id, state string) error {
 	return err
 }
 
-const runCols = `id, task, task_hash, state, trigger, engine, dir, started_at, COALESCE(finished_at,''), exit_code, subtype, model, cost_usd, num_turns, duration_ms, reason, error, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, models`
+const runCols = `id, task, task_hash, state, trigger, engine, dir, started_at, COALESCE(finished_at,''), exit_code, subtype, model, cost_usd, num_turns, duration_ms, reason, error, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, models, mode`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
 	var started, finished string
 	err := sc.Scan(&r.ID, &r.Task, &r.TaskHash, &r.State, &r.Trigger, &r.Engine, &r.Dir, &started, &finished, &r.ExitCode, &r.Subtype, &r.Model, &r.CostUSD, &r.NumTurns, &r.DurationMS, &r.Reason, &r.Error,
-		&r.InputTokens, &r.OutputTokens, &r.CacheReadTokens, &r.CacheCreationTokens, &r.Models)
+		&r.InputTokens, &r.OutputTokens, &r.CacheReadTokens, &r.CacheCreationTokens, &r.Models, &r.Mode)
 	r.StartedAt = parseTS(started)
 	r.FinishedAt = parseTS(finished)
 	return r, err
@@ -775,6 +792,135 @@ func (s *Store) ResetDeliveries(ctx context.Context, runID, sink string, now tim
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// Feed item states: new (not yet handed to a run), handed (part of a run
+// in progress), seen (a run evaluated it).
+const (
+	FeedNew    = "new"
+	FeedHanded = "handed"
+	FeedSeen   = "seen"
+)
+
+// FeedItem is one feed entry the host has seen for a task.
+type FeedItem struct {
+	Key, Title, Link, Source string
+	Published, FirstSeen     time.Time
+	State, RunID             string
+}
+
+// ClaimFeedItems records the fetched items of a task and hands up to limit
+// items that no finished run has evaluated yet to runID: the items that
+// are new in this fetch, and the items of earlier runs that failed. It
+// returns them, newest first; the rest stay new for the next run. With an
+// empty runID nothing is claimed; the call only reports what a run would
+// get.
+func (s *Store) ClaimFeedItems(ctx context.Context, task, runID string, items []FeedItem, limit int, now time.Time) ([]FeedItem, error) {
+	if limit <= 0 {
+		limit = 1 << 30
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	for _, it := range items {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO feed_items (task, key, title, link, source, published, first_seen, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			task, it.Key, it.Title, it.Link, it.Source, ts(it.Published), ts(now), FeedNew); err != nil {
+			return nil, err
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT key, title, link, source, published, first_seen, state, run_id FROM feed_items WHERE task=? AND state=? ORDER BY published DESC, first_seen DESC LIMIT ?`, task, FeedNew, limit)
+	if err != nil {
+		return nil, err
+	}
+	out, err := scanFeedItems(rows)
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	if runID != "" {
+		for i := range out {
+			if _, err := tx.ExecContext(ctx, `UPDATE feed_items SET state=?, run_id=? WHERE task=? AND key=?`, FeedHanded, runID, task, out[i].Key); err != nil {
+				return nil, err
+			}
+			out[i].State, out[i].RunID = FeedHanded, runID
+		}
+	}
+	return out, tx.Commit()
+}
+
+// ModelRunsSince counts the runs of a task with this trigger and mode that
+// started at or after since and were not skipped: the feed checks that
+// started a model, when mode is "feed".
+func (s *Store) ModelRunsSince(ctx context.Context, task, trigger, mode string, since time.Time) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE task=? AND trigger=? AND mode=? AND state<>? AND started_at>=?`, task, trigger, mode, StateSkipped, ts(since)).Scan(&n)
+	return n, err
+}
+
+// RecordFeedItemsSeen records items as seen without a run: items too old
+// to be news. An item that is already known keeps its state.
+func (s *Store) RecordFeedItemsSeen(ctx context.Context, task string, items []FeedItem, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, it := range items {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO feed_items (task, key, title, link, source, published, first_seen, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			task, it.Key, it.Title, it.Link, it.Source, ts(it.Published), ts(now), FeedSeen); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// SettleFeedItems closes the items handed to a run: seen when the run
+// evaluated them, back to new when it did not, so the next run gets them.
+func (s *Store) SettleFeedItems(ctx context.Context, runID string, evaluated bool) error {
+	if evaluated {
+		_, err := s.db.ExecContext(ctx, `UPDATE feed_items SET state=? WHERE run_id=? AND state=?`, FeedSeen, runID, FeedHanded)
+		return err
+	}
+	// The items are no longer attached to the run that did not evaluate them.
+	_, err := s.db.ExecContext(ctx, `UPDATE feed_items SET state=?, run_id='' WHERE run_id=? AND state=?`, FeedNew, runID, FeedHanded)
+	return err
+}
+
+// FeedItemsOf returns the items handed to a run.
+func (s *Store) FeedItemsOf(ctx context.Context, runID string) ([]FeedItem, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key, title, link, source, published, first_seen, state, run_id FROM feed_items WHERE run_id=? ORDER BY published DESC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFeedItems(rows)
+}
+
+// PruneFeedItems forgets seen items first seen before the cutoff. An item
+// that reappears in a feed after that is new again; feeds rarely keep
+// entries that long.
+func (s *Store) PruneFeedItems(ctx context.Context, before time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM feed_items WHERE state=? AND first_seen<?`, FeedSeen, ts(before))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func scanFeedItems(rows *sql.Rows) ([]FeedItem, error) {
+	var out []FeedItem
+	for rows.Next() {
+		var it FeedItem
+		var pub, first string
+		if err := rows.Scan(&it.Key, &it.Title, &it.Link, &it.Source, &pub, &first, &it.State, &it.RunID); err != nil {
+			return nil, err
+		}
+		it.Published, it.FirstSeen = parseTS(pub), parseTS(first)
+		out = append(out, it)
+	}
+	return out, rows.Err()
 }
 
 // PruneRuns deletes terminal runs beyond keep per task or older than

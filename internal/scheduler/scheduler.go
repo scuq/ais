@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,18 @@ import (
 
 	"github.com/scuq/ais/internal/task"
 )
+
+// Triggers name why a run starts. A "-full" trigger asks a task with
+// feeds for the full check instead of the feed check.
+const (
+	TriggerSchedule     = "schedule"
+	TriggerScheduleFull = "schedule-full"
+	TriggerManual       = "manual"
+	TriggerManualFull   = "manual-full"
+)
+
+// FullRun reports whether a trigger asks for the full check.
+func FullRun(trigger string) bool { return strings.HasSuffix(trigger, "-full") }
 
 // Runner executes one scheduled run.
 type Runner interface {
@@ -124,6 +137,19 @@ func (s *Scheduler) loop(ctx context.Context, t *task.Task) {
 			log.Error("schedule", "error", err)
 			return
 		}
+		// A task with feeds has a second schedule for the full run. When
+		// both come due in the same minute, the full run is the one.
+		trigger := TriggerSchedule
+		if t.Feeds != nil && t.Feeds.FullSchedule != "" {
+			full, err := NextRun(t.Feeds.FullSchedule, now, s.opts.Location)
+			if err != nil {
+				log.Error("feeds.fullSchedule", "error", err)
+				return
+			}
+			if !full.After(next.Add(time.Minute)) {
+				next, trigger = full, TriggerScheduleFull
+			}
+		}
 		if j := t.JitterOr(s.opts.DefaultJitter); j > 0 {
 			next = next.Add(time.Duration(rand.Int63n(int64(j))))
 		}
@@ -145,7 +171,7 @@ func (s *Scheduler) loop(ctx context.Context, t *task.Task) {
 			return
 		case s.sem <- struct{}{}:
 		}
-		if err := s.runner.Run(ctx, t, "schedule"); err != nil && !errors.Is(err, context.Canceled) {
+		if err := s.runner.Run(ctx, t, trigger); err != nil && !errors.Is(err, context.Canceled) {
 			log.Error("run", "error", err)
 		}
 		<-s.sem

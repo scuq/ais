@@ -5,11 +5,11 @@ version: 1
 name: vuln-watch
 description: Check of security feeds for vulnerabilities affecting inventoried products, hourly in the publication peak.
 enabled: true
-# Dense where advisories are published: once at 07 for the night, hourly
-# 10-18 (the European and US publication peak), at 20 and 22, nothing in the
-# night. The prompt looks back 24 hours, so a gap delays a finding but does
-# not lose it. Times are in scheduler.timezone.
-schedule: "7 7,10-18,20,22 * * *"
+# Feed checks every 20 minutes from 06 to 22; a check without a new feed
+# item starts no container and costs nothing. Nothing runs in the night;
+# the first check of the day picks the night up. feeds.maxRunsPerDay caps
+# the checks that start the model. Times are in scheduler.timezone.
+schedule: "7,27,47 6-22 * * *"
 jitter: 3m
 overlap: skip
 timeout: 20m
@@ -51,6 +51,39 @@ expose:
 
 tools: [WebFetch, WebSearch]
 allowedTools: [WebFetch, WebSearch, "mcp__inventory__*"]
+
+# The host reads these feeds before each scheduled run and hands the model
+# only the items that no earlier run evaluated; an hour without a new item
+# starts no container. Once a day, at fullSchedule, the run is the full
+# check with web search, which also covers sources without a feed (Citrix,
+# F5, GitHub advisories). 'ais feeds test vuln-watch' shows what the feeds
+# return. 'ais run vuln-watch --full' forces a full check.
+feeds:
+  fullSchedule: "7 20 * * *"
+  maxRunsPerDay: 12             # scheduled feed checks that may start the model in 24 h
+  urls:
+    - https://feeds.feedburner.com/TheHackersNews
+    - https://www.cert.at/cert-at.de.warnings.rss_2.0.xml
+    - https://www.cert.at/cert-at.de.all.rss_2.0.xml
+    - https://www.heise.de/security/rss/alert-news-atom.xml
+    - https://www.heise.de/security/rss/news-atom.xml
+    - https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
+    - https://www.cisa.gov/cybersecurity-advisories/all.xml
+    - https://cert.europa.eu/publications/security-advisories-rss
+    - https://www.infosecurity-magazine.com/rss/news/
+    - https://www.reddit.com/r/netsec/.rss
+    - https://security.paloaltonetworks.com/rss.xml
+    - https://sec.cloudapps.cisco.com/security/center/psirtrss20/CiscoSecurityAdvisory.xml
+    - https://www.fortiguard.com/rss/ir.xml
+    - https://api.msrc.microsoft.com/update-guide/rss
+    - https://github.com/keycloak/keycloak/releases.atom
+    - https://labs.watchtowr.com/rss/
+    - https://www.rapid7.com/blog/rss/
+    - https://unit42.paloaltonetworks.com/feed/
+    - https://www.horizon3.ai/feed/
+    - https://blog.talosintelligence.com/rss/
+    - https://www.tenable.com/blog/feed
+    - https://www.greynoise.io/blog/rss.xml
 
 # WebFetch runs inside the container, so every feed host must be listed.
 # WebSearch is server-side and needs nothing here. A leading dot allows the
@@ -103,13 +136,22 @@ pii:
 
 prompt: |
   You are a vulnerability analyst. Today is {{ .Now.Format "2006-01-02" }} (run {{ .Run.ID }}).
+  {{ if eq .Mode "feed" }}This is a feed check. The host read the news and advisory feeds and lists below the items
+  that no earlier run has evaluated. Work only on these items. Do not browse the sources and do not
+  search for other news. For each item, decide from its title and summary whether it can concern an
+  inventoried product; skip the rest without fetching them. Fetch an item that can, verify it against
+  the vendor advisory and NVD (use WebSearch only to find the advisory of that specific item), and
+  report findings as described below.
+  New items:
+  {{ range .Feed }}- {{ .Source }}: {{ .Title }} — {{ .Link }}{{ with .Summary }} ({{ . }}){{ end }}
+  {{ end }}{{ else }}This is the full daily check.
   Check these sources for vulnerabilities, zero-days and critical advisories published in the last 24 hours.
   Primary: The Hacker News (thehackernews.com, RSS at feeds.feedburner.com/TheHackersNews), CERT.at (cert.at),
   heise Security (heise.de/security). Catalogues: CISA Known Exploited Vulnerabilities (cisa.gov), CERT-EU (cert.europa.eu),
   Infosecurity Magazine, the r/cybersecurity and r/netsec feeds (reddit.com/r/<name>/.rss), GitHub Security Advisories.
   Verify against the vendor advisories: Cisco (sec.cloudapps.cisco.com), Citrix/NetScaler, Palo Alto Networks
   (security.paloaltonetworks.com), F5 (my.f5.com), Keycloak (keycloak.org and the project's GitHub advisories), and NVD for CVE details.
-  Only report findings that affect one of these inventoried products; version ranges matter.
+  {{ end }}Only report findings that affect one of these inventoried products; version ranges matter.
   Only report findings with severity critical or high. Drop medium and low findings; do not raise
   the severity of a finding to fit. Rate a vulnerability that is exploited in the wild as critical.
   The usage of a product tells you which features and interfaces are in use; drop a finding that needs
@@ -135,10 +177,10 @@ prompt: |
   A finding is closed when the inventory version of the product is the fixed version or newer. Compare
   the fixed version with the versions in the list above before you report; do not report a closed finding,
   and do not report an update for an earlier finding whose product the inventory shows as fixed.
-  In checked, list every advisory or news item that you evaluated in this run, reported or dropped, with
-  its URL, the product it concerns, and a short verdict (for example "reported", "version not affected",
-  "medium severity", "product not in inventory", "fixed in inventory", "reported (update)"). Do not repeat items that you skipped because an earlier
-  run checked them.
+  In checked, list every advisory or news item that you fetched and evaluated in this run, reported or
+  dropped, with its URL, the product it concerns, and a short verdict (for example "reported", "version not
+  affected", "medium severity", "product not in inventory", "fixed in inventory", "reported (update)").
+  Do not list items that you skipped by title, and do not repeat items that an earlier run checked.
   For each finding fill title (one line, what the flaw is), cvss (base score, null when none is published),
   exploited (true only when a source reports exploitation in the wild), affected (which products, models or
   configurations are affected and which are not), action (what an operator should check or do, with the

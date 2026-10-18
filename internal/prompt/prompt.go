@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/scuq/ais/internal/claude"
+	"github.com/scuq/ais/internal/feed"
 	"github.com/scuq/ais/internal/inventory"
 	"github.com/scuq/ais/internal/pseudo"
 	"github.com/scuq/ais/internal/task"
@@ -35,6 +36,10 @@ type Data struct {
 	Groups  []inventory.Group
 	Records []inventory.Record
 	Text    []string
+	// Mode is "full" (the complete check with web search) or "feed" (only
+	// the new feed items in Feed). A task without feeds is always full.
+	Mode string
+	Feed []feed.Item
 }
 
 // Env is the run-time environment the generated files refer to.

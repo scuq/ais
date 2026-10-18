@@ -14,6 +14,29 @@ usage, interest, and comments; it never sees a hostname or an address. Findings 
 against a JSON schema, joined back to the devices on the host, and delivered
 to the sinks listed under `sinks:`.
 
+Feed checks: the host reads the feeds and gives the model only the items that
+no earlier run evaluated. The task runs on the schedule below. A tick of the
+schedule is a feed run. If it has no new item, ais starts no container and
+records a `skipped` run with the reason `quiet`. Once a day, at 20:07
+(`feeds.fullSchedule`), the full check with web search runs. In a feed run, the
+model skips by title the items that cannot concern the inventory. It fetches
+and checks the other items. To force the full check, run
+`ais run --full vuln-watch`. To see what the feeds return, run
+`ais feeds test vuln-watch`.
+
+Feeds: The Hacker News, CERT.at (warnings and all), heise Security (alerts and
+news), CISA KEV (JSON), CISA advisories, CERT-EU advisories, Infosecurity
+Magazine, r/netsec, Palo Alto Networks, Cisco PSIRT, Fortinet PSIRT, MSRC,
+Keycloak releases, watchTowr, Rapid7, Unit 42, Horizon3, Talos, Tenable, and
+GreyNoise. These are 22 URLs.
+
+No feed: Citrix bulletins, F5, GitHub Security Advisories, Qualys, OpenBSD,
+Red Hat, FTAPI, Kemp, Sophos, Arctic Wolf, and VulnCheck. Only the daily full run
+covers these sources.
+
+The host fetches the feeds, so `egress.allow` does not apply to them. The
+model still needs the host of an item link in `egress.allow` to fetch it.
+
 Memory: each result has a list `checked` with the advisories and news items
 that the run evaluated, with the URL, the product, and a short verdict. The
 next run reads the last 20 results through `results_recent` and skips an item
@@ -26,11 +49,7 @@ when the results of the last 24 hours have no finding. The last run of the day
 is at 22:07. The digest shows the runs, the turns, and the items checked, so a
 day without findings is not silence. It goes to the `sinks`.
 
-Schedule: `7 7,10-18,20,22 * * *`. The task runs at minute 7: once at 07, at
-each hour from 10 to 18, and at 20 and 22. It does not run in the night. Most
-advisories are published between 09 and 18. The prompt looks back 24 hours, so
-a gap between runs delays a finding but does not lose it. The times are in `scheduler.timezone`. To change the schedule, use
-`ais tasks set vuln-watch schedule="..."`.
+Schedule: `7,27,47 6-22 * * *`. Each tick is a feed check, except the tick at 20:07, which is the full run (`feeds.fullSchedule`). A feed check without a new item starts no container and costs nothing, so the task runs every 20 minutes from 06 to 22 and not in the night; the first check of the day picks the night up. `feeds.maxRunsPerDay` (12) caps the feed checks that start the model in 24 hours, so that a feed with unstable item ids cannot start a run at every tick. Times are in `scheduler.timezone`. To change the schedule, use `ais tasks set vuln-watch schedule="..."`.
 
 Inputs: an inventory with at least `vendor` and `product`. The default file
 is `~/.config/ais/inventory.mdj`, and the format follows the file extension.
@@ -70,4 +89,5 @@ shows as fixed. An upgrade that you record in `inventory.mdj` ends the updates.
 
 The `webex` sink shows a finding with `previously_reported` and an `update`
 as a short update block. To get this in an existing task, install the template
-again with `ais templates use vuln-watch --force`.
+again with `ais templates use vuln-watch --force`. This also gives the task the
+`feeds` block and the two-mode prompt.

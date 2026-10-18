@@ -100,6 +100,7 @@ The capture in `stdout.json` still gets every line. `ParseEnvelope` finds the re
 | `internal/inventory` | Reads CSV, JSON, YAML, and `mdj` inventories, and the free-text inventory. Builds the minimized groups and gathers the collected values. `Document` is the parsed `mdj` structure: entries with a title, ordered JSON values, and sections. `mdj.go` parses it and writes it again (round trip). `panorama.go` reads a Panorama CSV export and merges it into a `Document`. The grouping adds the reserved field `count` (`CountField`). The records view has the field `title`. |
 | `internal/templates` | The task templates in the binary: list, show, and install. |
 | `internal/pseudo` | Field policy, tokens, token map, depseudonymization, redactor, and leak check. |
+| `internal/feed` | Fetches RSS 2.0, Atom, RDF, and CISA KEV JSON feeds on the host (`FetchAll`, at most four at a time). It reduces each entry to an `Item` with a `Key`: a hash of the GUID, else the link, else the title. A failed feed has `Err` set and no items. |
 | `internal/prompt` | Renders the prompt and the other input files. |
 | `internal/claude` | The Claude Code argument list, the result envelope, and output validation. |
 | `internal/container` | The container specification and its translation to an engine command line. It has the docker and podman dialects. |
@@ -325,13 +326,14 @@ The database is one SQLite file in WAL mode, `ais.db`, with mode 0600. The conne
 
 | Table | Content |
 |---|---|
-| `runs` | One row for each run: state, reason, cost, turns, and duration. |
+| `runs` | One row for each run: state, reason, cost, turns, duration, and the mode (`feed` or `full`; empty for rows from before feed checks). The cap `feeds.maxRunsPerDay` counts the rows with the mode `feed`, the trigger `schedule`, and a state other than `skipped`. |
 | `task_salts` | The salt of each task. |
 | `pseudonyms` | The token map of each task. |
 | `results` | The pseudonymized result and the clear result of each run. |
 | `leaks` | The values and the context of a leak. |
 | `prompts` | The system prompt, the prompt, and the arguments of each run. The retention rule removes a row with its run. |
 | `run_tokens` | Hashes of the bearer tokens, with expiry and revocation. |
+| `feed_items` | The feed items of each task, with the state `new`, `handed`, or `seen`, and the `run_id` that got them. The primary key is `task` and `key`. See Feed checks. |
 | `deliveries` | The delivery queue. The column `payload` holds the window of a `digest` row. `migrate` adds it to an existing database. |
 
 CAUTION: The database holds real values: the token map, the clear results, and the leaked values. Protect the state directory like the inventory.
@@ -433,12 +435,14 @@ The runner reads the secret at the start of each run, so a new token applies to 
 
 `internal/scheduler` starts one goroutine for each enabled task. The goroutine does these steps in a loop:
 
-1. Compute the next tick after now, in the scheduler timezone.
+1. Compute the next tick after now, in the scheduler timezone. If the task has `feeds.fullSchedule`, compute its next tick too. If it is not more than one minute after the tick of `schedule`, it replaces that tick and the trigger becomes `schedule-full`.
 2. Add a random delay between zero and the jitter.
 3. Wait.
 4. If the task is paused, skip the tick.
 5. Take a slot of `maxParallel`.
-6. Call the runner with the trigger `schedule`.
+6. Call the runner with the trigger `schedule`, or `schedule-full` for a full run.
+
+The triggers are the constants `TriggerSchedule`, `TriggerScheduleFull`, `TriggerManual`, and `TriggerManualFull`. `scheduler.FullRun` reports whether a trigger ends in `-full`. `ais run` uses `manual`, and `manual-full` with `--full`.
 
 The runner for the scheduler wraps `runner.Run`. Before the run it checks the redaction approval against the current policy. If the approval is not valid, it records a `skipped` run with the reason `redaction`. Then it checks the daily budget. After the run it counts the consecutive `auth` failures and pauses the task at the limit.
 
@@ -446,6 +450,23 @@ On SIGHUP, the daemon also reads `config.yaml` and replaces the policy (`reloadP
 
 On SIGHUP, `Reload` first clears all pauses. It then compares the hash of each task file with the loaded hash. It restarts the loop of a changed task, stops the loop of a removed task, and keeps the others.
 The hash is the first 16 characters of the SHA-256 of the file content.
+
+## Feed checks
+
+A task with `feeds` runs in one of two modes. `Prepare` sets the mode from the trigger. A trigger that ends in `-full` gives `full`, the old behavior. Any other trigger gives `feed`. A task without `feeds` is always `full`.
+
+In `feed` mode, `Prepare` calls `readFeeds` before it creates the prompt:
+
+1. `feed.FetchAll` fetches all URLs. `feeds.timeout` limits each fetch. A failed feed goes into the `FeedStatus` list with its error, and the others still count. If every feed fails, `readFeeds` returns an error and the run fails.
+2. `readFeeds` removes duplicate keys and calls `Store.ClaimFeedItems`. The call inserts new keys with the state `new`. It selects the items in the state `new`, newest first, up to `feeds.maxItems`. It sets them to `handed` with the run ID. The selection includes items of an earlier run that failed.
+3. The items go to the prompt as `.Feed`, and the mode as `.Mode`.
+
+If no item is new and `feeds.skipWhenQuiet` is true, `Prepare` removes the run directory and returns `ErrQuiet`. The runner then inserts a run in the state `skipped` with the reason `quiet`. The column `error` holds the counts from `feedSummary`. The runner starts no container.
+
+After the run, `Store.SettleFeedItems` sets the `handed` items of the run to `seen` if the run succeeded. In any other case it sets them to `new`, so the next feed run gets them again.
+`Store.PruneFeedItems` deletes `seen` items first seen before the cutoff. The retention job in `internal/app` calls it with the same cutoff as `retention.keepDays`. It does not run if `retention.keepDays` is 0.
+
+A dry run sets `Options.Peek`. `ClaimFeedItems` then gets an empty run ID and claims nothing. `ais feeds test` uses the same call. `BuildDigest` counts a `skipped` run with the reason `quiet` as `Quiet` and not as `Skipped`.
 
 ## Image
 

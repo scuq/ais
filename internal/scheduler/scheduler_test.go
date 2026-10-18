@@ -141,3 +141,11 @@ func TestReloadRestartsChanged(t *testing.T) {
 	cancel()
 	s.Wait()
 }
+
+func TestFullRunTrigger(t *testing.T) {
+	for trig, want := range map[string]bool{TriggerSchedule: false, TriggerScheduleFull: true, TriggerManual: false, TriggerManualFull: true, "": false} {
+		if FullRun(trig) != want {
+			t.Errorf("%q: %v", trig, FullRun(trig))
+		}
+	}
+}

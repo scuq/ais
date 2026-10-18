@@ -64,6 +64,7 @@ type Task struct {
 	Enrich []EnrichRule `yaml:"enrich"`
 	Sinks  []string     `yaml:"sinks"`
 	Digest *Digest      `yaml:"digest"`
+	Feeds  *Feeds       `yaml:"feeds"`
 
 	// Derived, not from YAML.
 	Path   string `yaml:"-"`
@@ -80,6 +81,56 @@ type Digest struct {
 	Window   time.Duration `yaml:"window"` // default 24h
 	Always   bool          `yaml:"always"`
 }
+
+// Feeds makes the host read RSS, Atom or KEV feeds before a run and hand
+// the model only the items that no earlier run evaluated. A tick of
+// Schedule is then a feed run; a tick of FullSchedule is a full run, the
+// old behaviour with web search. A feed run without a new item starts no
+// container when SkipWhenQuiet is set (the default).
+type Feeds struct {
+	URLs         []string `yaml:"urls"`
+	FullSchedule string   `yaml:"fullSchedule"`
+	// MaxItems caps the new items handed to one run; the rest wait for
+	// the next one. Default 150.
+	MaxItems      int   `yaml:"maxItems"`
+	SkipWhenQuiet *bool `yaml:"skipWhenQuiet"`
+	// Timeout bounds one feed fetch. Default 30s.
+	Timeout time.Duration `yaml:"timeout"`
+	// MaxAge: an item published longer ago than this is recorded as seen
+	// and never handed to a run; feeds that rotate old entries would
+	// otherwise present them as new. Default 168h. An item without a
+	// date counts as fresh.
+	MaxAge time.Duration `yaml:"maxAge"`
+	// MaxRunsPerDay caps the scheduled feed runs that start the model in
+	// any 24 hours, so that a broken feed cannot trigger run after run.
+	// A tick past the cap is recorded as skipped (reason ratelimit) and its
+	// items wait. Default 12; 0 means no cap. Full and manual runs do not
+	// count.
+	MaxRunsPerDay *int `yaml:"maxRunsPerDay"`
+}
+
+// DefaultFeedMaxAge is the age past which a feed item is never new.
+const DefaultFeedMaxAge = 7 * 24 * time.Hour
+
+// DefaultFeedMaxRunsPerDay is the cap on model-starting feed runs per day.
+const DefaultFeedMaxRunsPerDay = 12
+
+// RunCap returns the cap on scheduled feed runs per 24 hours; 0 is none.
+func (f *Feeds) RunCap() int {
+	if f == nil {
+		return 0
+	}
+	if f.MaxRunsPerDay == nil {
+		return DefaultFeedMaxRunsPerDay
+	}
+	return *f.MaxRunsPerDay
+}
+
+// DefaultFeedMaxItems is the cap of new items per run when a task sets none.
+const DefaultFeedMaxItems = 150
+
+// Quiet reports whether a feed run without new items starts no container.
+func (f *Feeds) Quiet() bool { return f == nil || f.SkipWhenQuiet == nil || *f.SkipWhenQuiet }
 
 // DefaultDigestWindow is the window of a digest that sets none.
 const DefaultDigestWindow = 24 * time.Hour
@@ -244,6 +295,17 @@ func Parse(data []byte, d Defaults) (*Task, error) {
 	if t.Digest != nil && t.Digest.Window == 0 {
 		t.Digest.Window = DefaultDigestWindow
 	}
+	if t.Feeds != nil {
+		if t.Feeds.MaxItems == 0 {
+			t.Feeds.MaxItems = DefaultFeedMaxItems
+		}
+		if t.Feeds.Timeout == 0 {
+			t.Feeds.Timeout = 30 * time.Second
+		}
+		if t.Feeds.MaxAge == 0 {
+			t.Feeds.MaxAge = DefaultFeedMaxAge
+		}
+	}
 	if t.Timeout == 0 {
 		t.Timeout = d.Timeout
 	}
@@ -358,6 +420,30 @@ func (t *Task) Validate() error {
 	}
 	if t.Jitter != nil && *t.Jitter < 0 {
 		return errors.New("jitter must not be negative")
+	}
+	if f := t.Feeds; f != nil {
+		if len(f.URLs) == 0 {
+			return errors.New("feeds.urls must list at least one feed")
+		}
+		for _, u := range f.URLs {
+			if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+				return fmt.Errorf("feeds.urls: %q is not an http(s) URL", u)
+			}
+		}
+		if f.FullSchedule != "" {
+			if !gronx.IsValid(f.FullSchedule) {
+				return fmt.Errorf("feeds.fullSchedule %q is not a valid cron expression", f.FullSchedule)
+			}
+			if fields := strings.Fields(f.FullSchedule); !strings.HasPrefix(f.FullSchedule, "@") && len(fields) != 5 {
+				return fmt.Errorf("feeds.fullSchedule %q must have 5 fields (minute hour day month weekday) or be @daily", f.FullSchedule)
+			}
+		}
+		if f.MaxItems <= 0 || f.Timeout <= 0 || f.MaxAge <= 0 {
+			return errors.New("feeds.maxItems, feeds.timeout and feeds.maxAge must be positive")
+		}
+		if f.MaxRunsPerDay != nil && *f.MaxRunsPerDay < 0 {
+			return errors.New("feeds.maxRunsPerDay must not be negative")
+		}
 	}
 	if d := t.Digest; d != nil {
 		if d.Schedule == "" {

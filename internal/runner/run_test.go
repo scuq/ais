@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"github.com/scuq/ais/assets"
 	"github.com/scuq/ais/internal/config"
 	"github.com/scuq/ais/internal/runtime"
+	"github.com/scuq/ais/internal/scheduler"
 	"github.com/scuq/ais/internal/secret"
 	"github.com/scuq/ais/internal/store"
 	"github.com/scuq/ais/internal/task"
@@ -42,6 +45,9 @@ func fixture(t *testing.T) (*Runner, *runtime.Fake, *task.Task) {
 	if err := tk.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	// The template's feeds point at the internet; tests never fetch them.
+	// feedFixture sets a local feed server where a test needs one.
+	tk.Feeds = nil
 	st, err := store.Open(filepath.Join(dir, "ais.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -310,5 +316,132 @@ func TestLiveRunRendersStream(t *testing.T) {
 	argv, _ := os.ReadFile(filepath.Join(out.Dir, "in", "argv.json"))
 	if !strings.Contains(string(argv), "stream-json") || !strings.Contains(string(argv), "--verbose") {
 		t.Errorf("stream-json not requested: %s", argv)
+	}
+}
+
+// feedFixture turns the fixture task into a feed task with a feed server
+// that returns the given items.
+func feedFixture(t *testing.T, body string) (*Runner, *runtime.Fake, *task.Task, *httptest.Server) {
+	t.Helper()
+	r, fake, tk := fixture(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(body)) }))
+	t.Cleanup(srv.Close)
+	tk.Feeds = &task.Feeds{URLs: []string{srv.URL + "/rss"}, FullSchedule: "7 20 * * *", MaxItems: 10, Timeout: 5 * time.Second, MaxAge: 100 * 365 * 24 * time.Hour}
+	return r, fake, tk, srv
+}
+
+const rssTwo = `<rss version="2.0"><channel><title>T</title><item><title>PAN-OS flaw</title><link>https://example.test/a</link><guid>a</guid><pubDate>Fri, 17 Oct 2026 08:00:00 +0000</pubDate></item><item><title>Other</title><link>https://example.test/b</link><guid>b</guid></item></channel></rss>`
+
+func TestFeedRunHandsNewItemsThenGoesQuiet(t *testing.T) {
+	r, fake, tk, _ := feedFixture(t, rssTwo)
+	fake.Stdout = okEnvelope
+	out, err := r.Run(context.Background(), tk, scheduler.TriggerSchedule)
+	if err != nil || out.Run.State != store.StateSucceeded {
+		t.Fatalf("%+v %v", out.Run, err)
+	}
+	pl, _ := r.Store.GetPrompt(context.Background(), out.Run.ID)
+	if !strings.Contains(pl.Prompt, "This is a feed check") || !strings.Contains(pl.Prompt, "- T: PAN-OS flaw — https://example.test/a") || strings.Contains(pl.Prompt, "full daily check") {
+		t.Errorf("feed prompt:\n%s", pl.Prompt)
+	}
+	items, _ := r.Store.FeedItemsOf(context.Background(), out.Run.ID)
+	if len(items) != 2 || items[0].State != store.FeedSeen {
+		t.Errorf("items after success: %+v", items)
+	}
+	// Nothing new: a quiet run, no container.
+	calls := len(fake.Calls)
+	out, err = r.Run(context.Background(), tk, scheduler.TriggerSchedule)
+	if err != nil || out.Run.State != store.StateSkipped || out.Run.Reason != ReasonQuiet || !strings.Contains(out.Run.Error, "none new") {
+		t.Fatalf("quiet run: %+v %v", out.Run, err)
+	}
+	if len(fake.Calls) != calls {
+		t.Error("a container ran for a quiet check")
+	}
+	// The full trigger runs the full check even without new items.
+	out, err = r.Run(context.Background(), tk, scheduler.TriggerScheduleFull)
+	if err != nil || out.Run.State != store.StateSucceeded {
+		t.Fatalf("full run: %+v %v", out.Run, err)
+	}
+	pl, _ = r.Store.GetPrompt(context.Background(), out.Run.ID)
+	if !strings.Contains(pl.Prompt, "full daily check") || strings.Contains(pl.Prompt, "feed check") {
+		t.Errorf("full prompt:\n%s", pl.Prompt)
+	}
+}
+
+func TestFeedRunFailureReturnsItems(t *testing.T) {
+	r, fake, tk, _ := feedFixture(t, rssTwo)
+	fake.Stdout = `{"type":"result","subtype":"error_max_turns","is_error":true,"result":"stopped","num_turns":1}`
+	out, err := r.Run(context.Background(), tk, scheduler.TriggerSchedule)
+	if err != nil || out.Run.State != store.StateFailed {
+		t.Fatalf("%+v %v", out.Run, err)
+	}
+	items, _ := r.Store.FeedItemsOf(context.Background(), out.Run.ID)
+	if len(items) != 0 {
+		t.Errorf("items still attached to the failed run: %+v", items)
+	}
+	fake.Stdout = okEnvelope
+	out, _ = r.Run(context.Background(), tk, scheduler.TriggerSchedule)
+	if out.Run.State != store.StateSucceeded {
+		t.Fatalf("retry: %+v", out.Run)
+	}
+	if items, _ := r.Store.FeedItemsOf(context.Background(), out.Run.ID); len(items) != 2 {
+		t.Errorf("retry did not get the items back: %+v", items)
+	}
+}
+
+func TestFeedRunIgnoresOldItems(t *testing.T) {
+	r, fake, tk, _ := feedFixture(t, rssTwo)
+	tk.Feeds.MaxAge = time.Hour // the dated item is from 2026-10-17 08:00, long ago for this clock
+	fake.Stdout = okEnvelope
+	out, err := r.Run(context.Background(), tk, scheduler.TriggerSchedule)
+	if err != nil || out.Run.State != store.StateSucceeded {
+		t.Fatalf("%+v %v", out.Run, err)
+	}
+	pl, _ := r.Store.GetPrompt(context.Background(), out.Run.ID)
+	if strings.Contains(pl.Prompt, "PAN-OS flaw") || !strings.Contains(pl.Prompt, "- T: Other") {
+		t.Errorf("old item handed to the run:\n%s", pl.Prompt)
+	}
+}
+
+func TestFeedRunCapHoldsBackScheduledRuns(t *testing.T) {
+	r, fake, tk, _ := feedFixture(t, rssTwo)
+	one := 1
+	tk.Feeds.MaxRunsPerDay = &one
+	fake.Stdout = okEnvelope
+	if out, err := r.Run(context.Background(), tk, scheduler.TriggerSchedule); err != nil || out.Run.State != store.StateSucceeded {
+		t.Fatalf("first: %+v %v", out.Run, err)
+	}
+	// New items appear, but the cap is reached: skipped, items wait.
+	srvItems := strings.Replace(rssTwo, "<guid>a</guid>", "<guid>c</guid>", 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(srvItems)) }))
+	defer srv.Close()
+	tk.Feeds.URLs = []string{srv.URL + "/rss"}
+	calls := len(fake.Calls)
+	out, err := r.Run(context.Background(), tk, scheduler.TriggerSchedule)
+	if err != nil || out.Run.State != store.StateSkipped || out.Run.Reason != ReasonRateLimit || !strings.Contains(out.Run.Error, "1 new item(s) wait") {
+		t.Fatalf("capped run: %+v %v", out.Run, err)
+	}
+	if len(fake.Calls) != calls {
+		t.Error("a container ran although the cap was reached")
+	}
+	if items, _ := r.Store.FeedItemsOf(context.Background(), out.Run.ID); len(items) != 0 {
+		t.Errorf("items stayed attached to the capped run: %+v", items)
+	}
+	// A manual run is deliberate and bypasses the cap; it gets the waiting item.
+	out, err = r.Run(context.Background(), tk, scheduler.TriggerManual)
+	if err != nil || out.Run.State != store.StateSucceeded {
+		t.Fatalf("manual: %+v %v", out.Run, err)
+	}
+	pl, _ := r.Store.GetPrompt(context.Background(), out.Run.ID)
+	if !strings.Contains(pl.Prompt, "PAN-OS flaw") {
+		t.Errorf("waiting item not handed to the manual run:\n%s", pl.Prompt)
+	}
+	n, _ := r.Store.ModelRunsSince(context.Background(), tk.Name, scheduler.TriggerSchedule, "feed", time.Now().Add(-24*time.Hour))
+	if n != 1 {
+		t.Errorf("model runs counted: %d", n)
+	}
+	// Runs of the old kind, without a mode, never count against the cap.
+	_ = r.Store.InsertRun(context.Background(), store.Run{ID: "legacy", Task: tk.Name, State: store.StateSucceeded, Trigger: scheduler.TriggerSchedule, StartedAt: time.Now()})
+	if n, _ := r.Store.ModelRunsSince(context.Background(), tk.Name, scheduler.TriggerSchedule, "feed", time.Now().Add(-24*time.Hour)); n != 1 {
+		t.Errorf("legacy run counted: %d", n)
 	}
 }

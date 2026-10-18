@@ -227,3 +227,50 @@ func TestRunsBetweenAndPayload(t *testing.T) {
 		t.Errorf("due payload: %+v", due)
 	}
 }
+
+func TestFeedItems(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "ais.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	items := []FeedItem{{Key: "a", Title: "A", Published: now.Add(-time.Hour)}, {Key: "b", Title: "B", Published: now.Add(-2 * time.Hour)}, {Key: "c", Title: "C", Published: now.Add(-3 * time.Hour)}}
+	// A peek reports without claiming.
+	peek, err := s.ClaimFeedItems(ctx, "t", "", items, 0, now)
+	if err != nil || len(peek) != 3 || peek[0].State != FeedNew {
+		t.Fatalf("peek: %+v %v", peek, err)
+	}
+	// A run claims at most limit items, newest first.
+	got, err := s.ClaimFeedItems(ctx, "t", "r1", items, 2, now)
+	if err != nil || len(got) != 2 || got[0].Key != "a" || got[1].Key != "b" || got[0].State != FeedHanded {
+		t.Fatalf("claim: %+v %v", got, err)
+	}
+	// A failed run gives its items back; the next run gets them plus the rest.
+	if err := s.SettleFeedItems(ctx, "r1", false); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.ClaimFeedItems(ctx, "t", "r2", items, 10, now)
+	if len(got) != 3 {
+		t.Fatalf("after failure: %+v", got)
+	}
+	_ = s.SettleFeedItems(ctx, "r2", true)
+	// Seen items do not come back, a new one does; another task has its own view.
+	got, _ = s.ClaimFeedItems(ctx, "t", "r3", append(items, FeedItem{Key: "d", Title: "D", Published: now}), 10, now)
+	if len(got) != 1 || got[0].Key != "d" {
+		t.Errorf("new only: %+v", got)
+	}
+	other, _ := s.ClaimFeedItems(ctx, "u", "", items, 10, now)
+	if len(other) != 3 {
+		t.Errorf("per task: %+v", other)
+	}
+	of, _ := s.FeedItemsOf(ctx, "r2")
+	if len(of) != 3 || of[0].State != FeedSeen {
+		t.Errorf("items of r2: %+v", of)
+	}
+	n, err := s.PruneFeedItems(ctx, now.Add(time.Minute))
+	if err != nil || n != 3 {
+		t.Errorf("prune: %d %v", n, err)
+	}
+}

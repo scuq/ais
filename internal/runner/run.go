@@ -37,6 +37,11 @@ const (
 	ReasonLeak      = "leak"
 	ReasonModel     = "model"
 	ReasonRedaction = "redaction"
+	// ReasonQuiet marks a feed check that found no new item and started
+	// no container.
+	ReasonQuiet = "quiet"
+	// ReasonRateLimit marks a feed check held back by feeds.maxRunsPerDay.
+	ReasonRateLimit = "ratelimit"
 )
 
 // TokenMinter issues the per-run bearer token the backend accepts. Nil
@@ -66,6 +71,22 @@ type Outcome struct {
 	Pseudo json.RawMessage // the model's structured_output as returned
 	Leaks  []pseudo.Finding
 	Dir    string
+}
+
+// feedSummary says what the feeds returned, for the row of a quiet run.
+func feedSummary(st []FeedStatus) string {
+	items, failed := 0, 0
+	for _, f := range st {
+		items += f.Items
+		if f.Err != "" {
+			failed++
+		}
+	}
+	s := fmt.Sprintf("%d feed(s), %d item(s), none new", len(st), items)
+	if failed > 0 {
+		s += fmt.Sprintf(", %d feed(s) failed", failed)
+	}
+	return s
 }
 
 // Succeeded reports whether the run ended in success.
@@ -134,11 +155,40 @@ func (r *Runner) Run(ctx context.Context, t *task.Task, trigger string) (*Outcom
 		return &Outcome{Run: run}, nil
 	}
 
-	prep, err := Prepare(ctx, r.Cfg, t, r.Store, r.Opts)
+	opts := r.Opts
+	opts.Trigger, opts.Feeds = trigger, r.Store
+	prep, err := Prepare(ctx, r.Cfg, t, r.Store, opts)
+	if errors.Is(err, ErrQuiet) {
+		run := store.Run{ID: prep.RunID, Task: t.Name, TaskHash: t.Hash, State: store.StateSkipped, Trigger: trigger, Engine: r.Opts.Engine, StartedAt: prep.StartedAt, FinishedAt: r.now(), Model: t.Model, Reason: ReasonQuiet, Error: feedSummary(prep.Feeds), Mode: prep.Mode}
+		if err := r.Store.InsertRun(ctx, run); err != nil {
+			return nil, err
+		}
+		log.Info("quiet: no new feed items", "run", run.ID, "feeds", len(prep.Feeds))
+		return &Outcome{Run: run}, nil
+	}
+	if errors.Is(err, ErrRateLimited) {
+		run := store.Run{ID: prep.RunID, Task: t.Name, TaskHash: t.Hash, State: store.StateSkipped, Trigger: trigger, Engine: r.Opts.Engine, StartedAt: prep.StartedAt, FinishedAt: r.now(), Model: t.Model, Reason: ReasonRateLimit, Error: err.Error(), Mode: prep.Mode}
+		if err := r.Store.InsertRun(ctx, run); err != nil {
+			return nil, err
+		}
+		log.Warn("feed check held back: feeds.maxRunsPerDay reached", "run", run.ID, "new_items", len(prep.Feed))
+		return &Outcome{Run: run}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	run := store.Run{ID: prep.RunID, Task: t.Name, TaskHash: t.Hash, State: store.StateRunning, Trigger: trigger, Engine: r.Opts.Engine, Dir: prep.RunDir, StartedAt: prep.StartedAt, Model: t.Model}
+	for _, f := range prep.Feeds {
+		switch {
+		case f.Err != "":
+			log.Warn("feed failed", "url", f.URL, "error", f.Err)
+		case f.Unstable:
+			log.Warn("feed returns only new items; its ids or links may change on every fetch", "url", f.URL, "items", f.Items)
+		}
+	}
+	if prep.Mode == "feed" {
+		log.Info("feed check", "run", prep.RunID, "new_items", len(prep.Feed), "feeds", len(prep.Feeds))
+	}
+	run := store.Run{ID: prep.RunID, Task: t.Name, TaskHash: t.Hash, State: store.StateRunning, Trigger: trigger, Engine: r.Opts.Engine, Dir: prep.RunDir, StartedAt: prep.StartedAt, Model: t.Model, Mode: prep.Mode}
 	if err := r.Store.InsertRun(ctx, run); err != nil {
 		return nil, err
 	}
@@ -174,6 +224,12 @@ func (r *Runner) Run(ctx context.Context, t *task.Task, trigger string) (*Outcom
 	ctx = context.WithoutCancel(ctx)
 	if err := r.Store.FinishRun(ctx, outcome.Run); err != nil {
 		return outcome, err
+	}
+	if prep.Mode == "feed" {
+		// Items of a run that did not succeed come back in the next run.
+		if err := r.Store.SettleFeedItems(ctx, prep.RunID, outcome.Run.State == store.StateSucceeded); err != nil {
+			log.Error("feed items not settled", "error", err)
+		}
 	}
 	switch outcome.Run.State {
 	case store.StateSucceeded:

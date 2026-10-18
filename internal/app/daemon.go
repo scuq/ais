@@ -445,6 +445,13 @@ func prune(ctx context.Context, cfg *config.Config, st *store.Store, log *slog.L
 	if keep <= 0 {
 		keep = 1 << 30
 	}
+	if !before.IsZero() {
+		if n, err := st.PruneFeedItems(ctx, before); err != nil {
+			log.Error("retention: feed items", "error", err)
+		} else if n > 0 {
+			log.Info("pruned feed items", "count", n)
+		}
+	}
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue

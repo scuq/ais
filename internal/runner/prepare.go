@@ -18,9 +18,11 @@ import (
 	"github.com/scuq/ais/internal/config"
 	"github.com/scuq/ais/internal/container"
 	"github.com/scuq/ais/internal/egress"
+	"github.com/scuq/ais/internal/feed"
 	"github.com/scuq/ais/internal/inventory"
 	"github.com/scuq/ais/internal/prompt"
 	"github.com/scuq/ais/internal/pseudo"
+	"github.com/scuq/ais/internal/scheduler"
 	"github.com/scuq/ais/internal/store"
 	"github.com/scuq/ais/internal/task"
 )
@@ -63,6 +65,15 @@ type Options struct {
 	Now time.Time
 	// RunID overrides the generated id (tests).
 	RunID string
+	// Trigger says why the run starts (scheduler.Trigger*). A "-full"
+	// trigger makes a task with feeds do the full check.
+	Trigger string
+	// Feeds remembers which feed items earlier runs evaluated; nil means
+	// every item is new and nothing is recorded (dry runs).
+	Feeds FeedStore
+	// Peek makes a feed check report the new items without claiming them
+	// (dry runs).
+	Peek bool
 	// SELinux adds the relabel option to bind mounts.
 	SELinux bool
 	// Live receives a rendered event stream while the container runs; nil
@@ -85,9 +96,42 @@ type Prepared struct {
 	Rules     pseudo.Rules
 	// BackendURL is the inventory MCP endpoint, empty when none.
 	BackendURL string
+	// Mode is "full" or "feed"; Feed holds the new items of a feed run
+	// and Feeds what each feed returned.
+	Mode  string
+	Feed  []feed.Item
+	Feeds []FeedStatus
 }
 
-// Prepare builds everything a run needs without starting a container.
+// FeedStore is the part of the store that remembers feed items.
+type FeedStore interface {
+	ClaimFeedItems(ctx context.Context, task, runID string, items []store.FeedItem, limit int, now time.Time) ([]store.FeedItem, error)
+	RecordFeedItemsSeen(ctx context.Context, task string, items []store.FeedItem, now time.Time) error
+	ModelRunsSince(ctx context.Context, task, trigger, mode string, since time.Time) (int, error)
+}
+
+// FeedStatus is what one feed returned for a run, for logs and dry runs.
+type FeedStatus struct {
+	URL   string `json:"url"`
+	Items int    `json:"items"`
+	New   int    `json:"new"`
+	Err   string `json:"error,omitempty"`
+	// Unstable is set when every item of a feed with several items is new
+	// again: its ids or links change from fetch to fetch, and it would
+	// make every tick a model run. The cap on runs per day holds that.
+	Unstable bool `json:"unstable,omitempty"`
+}
+
+// ErrQuiet means a feed check found no new item; no container starts.
+var ErrQuiet = errors.New("no new feed items")
+
+// ErrRateLimited means the task reached feeds.maxRunsPerDay; the new
+// items wait for a later tick, and no container starts.
+var ErrRateLimited = errors.New("feeds.maxRunsPerDay reached")
+
+// Prepare builds everything a run needs without starting a container. For
+// a task with feeds, a run that is not a full run reads the feeds first
+// and returns ErrQuiet when nothing is new and the task skips quiet runs.
 func Prepare(ctx context.Context, cfg *config.Config, t *task.Task, salts SaltSource, opts Options) (*Prepared, error) {
 	now := opts.Now
 	if now.IsZero() {
@@ -127,6 +171,36 @@ func Prepare(ctx context.Context, cfg *config.Config, t *task.Task, salts SaltSo
 				return nil, fmt.Errorf("%w (create the file or remove inventory.textFile)", err)
 			}
 			return nil, err
+		}
+	}
+
+	mode := "full"
+	var feedItems []feed.Item
+	var feedStatus []FeedStatus
+	if t.Feeds != nil && !scheduler.FullRun(opts.Trigger) {
+		mode = "feed"
+		var err error
+		if feedItems, feedStatus, err = readFeeds(ctx, t, runID, now, opts); err != nil {
+			return nil, err
+		}
+		if len(feedItems) == 0 && t.Feeds.Quiet() {
+			_ = os.RemoveAll(runDir)
+			return &Prepared{Task: t, RunID: runID, StartedAt: now, Mode: mode, Feeds: feedStatus}, ErrQuiet
+		}
+		if cap := t.Feeds.RunCap(); cap > 0 && opts.Feeds != nil && !opts.Peek && opts.Trigger == scheduler.TriggerSchedule {
+			n, err := opts.Feeds.ModelRunsSince(ctx, t.Name, scheduler.TriggerSchedule, mode, now.Add(-24*time.Hour))
+			if err != nil {
+				return nil, err
+			}
+			if n >= cap {
+				_ = os.RemoveAll(runDir)
+				if rel, ok := opts.Feeds.(interface {
+					SettleFeedItems(context.Context, string, bool) error
+				}); ok {
+					_ = rel.SettleFeedItems(ctx, runID, false) // the items wait for a later tick
+				}
+				return &Prepared{Task: t, RunID: runID, StartedAt: now, Mode: mode, Feed: feedItems, Feeds: feedStatus}, fmt.Errorf("%w: %d scheduled feed run(s) started the model in the last 24 h; %d new item(s) wait", ErrRateLimited, n, len(feedItems))
+			}
 		}
 	}
 
@@ -201,6 +275,8 @@ func Prepare(ctx context.Context, cfg *config.Config, t *task.Task, salts SaltSo
 		Groups:  groups,
 		Records: pseudoRecs,
 		Text:    pseudoText,
+		Mode:    mode,
+		Feed:    feedItems,
 	}
 	files, err := prompt.Generate(t, data, prompt.Env{
 		BackendURL:  backendURL,
@@ -253,7 +329,96 @@ func Prepare(ctx context.Context, cfg *config.Config, t *task.Task, salts SaltSo
 		Records:    recs,
 		Rules:      rules,
 		BackendURL: backendURL,
+		Mode:       mode,
+		Feed:       feedItems,
+		Feeds:      feedStatus,
 	}, nil
+}
+
+// readFeeds fetches the task's feeds and returns the items that no earlier
+// run evaluated, newest first and capped at feeds.maxItems. A feed that
+// fails is reported in the status and skipped; the others still count.
+func readFeeds(ctx context.Context, t *task.Task, runID string, now time.Time, opts Options) ([]feed.Item, []FeedStatus, error) {
+	results := feed.FetchAll(ctx, t.Feeds.URLs, t.Feeds.Timeout)
+	var status []FeedStatus
+	var all []store.FeedItem
+	byKey := map[string]feed.Item{}
+	failed := 0
+	for _, r := range results {
+		st := FeedStatus{URL: r.URL, Items: len(r.Items)}
+		if r.Err != nil {
+			st.Err = r.Err.Error()
+			failed++
+		}
+		status = append(status, st)
+		for _, it := range r.Items {
+			if _, dup := byKey[it.Key]; dup {
+				continue
+			}
+			byKey[it.Key] = it
+			all = append(all, store.FeedItem{Key: it.Key, Title: it.Title, Link: it.Link, Source: it.Source, Published: it.Published})
+		}
+	}
+	if failed == len(results) {
+		return nil, status, fmt.Errorf("feeds: every feed failed (%s)", status[0].Err)
+	}
+	// Old items are news to nobody: a feed that rotates its entries must
+	// not present them as new.
+	cutoff := now.Add(-t.Feeds.MaxAge)
+	var recent, old []store.FeedItem
+	for _, it := range all {
+		if !it.Published.IsZero() && it.Published.Before(cutoff) {
+			old = append(old, it)
+		} else {
+			recent = append(recent, it)
+		}
+	}
+	if opts.Feeds != nil && len(old) > 0 && !opts.Peek {
+		if err := opts.Feeds.RecordFeedItemsSeen(ctx, t.Name, old, now); err != nil {
+			return nil, status, fmt.Errorf("feeds: %w", err)
+		}
+	}
+	all = recent
+	var fresh []store.FeedItem
+	if opts.Feeds == nil {
+		fresh = all
+		if len(fresh) > t.Feeds.MaxItems {
+			fresh = fresh[:t.Feeds.MaxItems]
+		}
+	} else {
+		claimAs := runID
+		if opts.Peek {
+			claimAs = ""
+		}
+		var err error
+		if fresh, err = opts.Feeds.ClaimFeedItems(ctx, t.Name, claimAs, all, t.Feeds.MaxItems, now); err != nil {
+			return nil, status, fmt.Errorf("feeds: %w", err)
+		}
+	}
+	freshKeys := map[string]bool{}
+	for _, f := range fresh {
+		freshKeys[f.Key] = true
+	}
+	for i, r := range results {
+		for _, it := range r.Items {
+			if freshKeys[it.Key] {
+				status[i].New++
+			}
+		}
+		if status[i].Items >= 5 && status[i].New == status[i].Items {
+			status[i].Unstable = true
+		}
+	}
+	out := make([]feed.Item, 0, len(fresh))
+	for _, f := range fresh {
+		it, ok := byKey[f.Key]
+		if !ok {
+			// An item from an earlier failed run that the feed no longer lists.
+			it = feed.Item{Key: f.Key, Title: f.Title, Link: f.Link, Source: f.Source, Published: f.Published}
+		}
+		out = append(out, it)
+	}
+	return out, status, nil
 }
 
 // inventorySources resolves the record source and the free-text file: a

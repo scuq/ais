@@ -5,11 +5,12 @@
     ais <command> [options] [args...]
 
     ais daemon
-    ais run [--dry-run] [--live|--follow] [--engine docker|podman] [--json] [--no-autobuild] <task>
+    ais run [--dry-run] [--live|--follow] [--full] [--engine docker|podman] [--json] [--no-autobuild] <task>
     ais tasks list [--json] | validate | show <task>
     ais tasks set <task> key=value...
     ais sinks list | test <sink> [--run RUN-ID] [--print]
     ais digest <task> [--print] [--window D]
+    ais feeds test [--items] <task> | ais feeds seen <task>
     ais templates list [--json] | show <name> | use <name> [--as NAME] [--force]
     ais runs list [--task T] [--state S] [-n N] [--json]
     ais runs show [--clear] [--prompt] [--json] <run-id>
@@ -306,7 +307,7 @@ The task keys `pii.redact.domains`, `pii.redact.cidrs`, and `pii.redact.literals
 | Key | Default | Meaning |
 |---|---|---|
 | `retention.keepRuns` | `500` | Number of finished runs to keep for each task. `0` means no limit. |
-| `retention.keepDays` | `90` | Age in days after which a finished run is deleted. `0` means no limit. |
+| `retention.keepDays` | `90` | Age in days after which a finished run or a `seen` feed item is deleted. `0` means no limit. |
 
 ### inventory
 
@@ -627,7 +628,7 @@ A task with no finished run gets no digest, and the daemon logs `digest not sent
 The event has `kind: digest`, `task`, `run_id` (the run of the delivery), `state: digest`, and `finished_at` (the window end). The field `digest` has these keys:
 
 - `window_start` and `window_end`.
-- `runs`, `succeeded`, `failed`, `skipped`, and `findings`. `failed` counts runs in the state `failed`, `leaked`, and `timeout`. `skipped` counts runs skipped because of overlap, and cancelled runs.
+- `runs`, `succeeded`, `failed`, `skipped`, `quiet`, and `findings`. `failed` counts runs in the state `failed`, `leaked`, and `timeout`. `skipped` counts runs skipped because of overlap, and cancelled runs. `quiet` counts feed checks that found no new item (see Feed checks).
 - `checked`, only if the results have a `checked` list.
 - `next_run`.
 
@@ -637,7 +638,7 @@ Webhook and NATS sinks receive the event as JSON. The Splunk `split` setting doe
 A Webex sink shows a digest like this:
 
 1. A headline: `✅ **<title>**: nothing found in the last 24 h`. With `always: true` and findings, it is `🔎 **<title>**: N finding(s) in the last 24 h`.
-2. A line such as `12 run(s) (11 succeeded, 1 failed) · 290 turns · 184 items checked`.
+2. A line such as `12 run(s) (11 succeeded, 1 failed) · 290 turns · 184 items checked`. A quiet run adds `N quiet` to the list in parentheses.
 3. A footer with the window end, the models, the tokens, the billing, and the next run, for example `<window end> · <models> · <in>k in / <out>k out · subscription (est. $x) · next run <time>`.
 
 With `card: true`, the Adaptive Card has the same content.
@@ -648,10 +649,10 @@ CAUTION: The device names come from the enrich rules. A Webex message contains r
 
 A task is one YAML file in the tasks directory. The extension is `.yaml` or `.yml`. The name of each task must be unique.
 The template `vuln-watch` (`assets/templates/vuln-watch/task.yaml`) is a complete example.
-It checks these sources every hour:
+It checks the feeds every 20 minutes from 06 to 22 (`7,27,47 6-22 * * *`) and runs the full check at 20:07. See Feed checks.
 
 - Primary: The Hacker News (RSS through `feeds.feedburner.com`), CERT.at, and heise Security.
-- Catalogues: CISA Known Exploited Vulnerabilities, CERT-EU, Infosecurity Magazine, the RSS feeds of r/cybersecurity and r/netsec, and GitHub Security Advisories.
+- Catalogues: CISA Known Exploited Vulnerabilities, CISA advisories, CERT-EU, Infosecurity Magazine, the RSS feeds of r/cybersecurity and r/netsec, and GitHub Security Advisories.
 - Verification: the advisories of Cisco, Citrix and NetScaler, Palo Alto Networks, F5, Keycloak, Microsoft (`msrc.microsoft.com`), and Fortinet (`fortiguard.fortinet.com`), and NVD for CVE details.
 - Research blogs: watchTowr Labs, Rapid7, Palo Alto Unit 42, Horizon3.ai, Assetnote, Cisco Talos, Tenable, Qualys, Mandiant / Google Threat Intelligence (`cloud.google.com`), GreyNoise, VulnCheck, Bishop Fox, ProjectDiscovery, Arctic Wolf Labs, and Sophos X-Ops (`news.sophos.com`).
 
@@ -694,6 +695,13 @@ To change top-level keys without an editor, use `ais tasks set`.
 | `enrich` | none | List of rules that attach inventory data to the result on the host. |
 | `sinks` | none | Names of sinks from `config.yaml`. |
 | `digest` | none | Map that sends a periodic summary to the `sinks`. See Digest. The command `ais tasks set` does not change it. |
+| `feeds.urls` | none | Required if `feeds` is set. List of `http://` or `https://` URLs of RSS 2.0, Atom, or RDF feeds, or of the CISA KEV JSON catalog. |
+| `feeds.fullSchedule` | none | Cron expression with five fields, or a descriptor such as `@daily`. A tick of it starts a full run. |
+| `feeds.maxItems` | `150` | Maximum number of new items for one run. The other items wait for the next run. |
+| `feeds.skipWhenQuiet` | `true` | If `true`, a feed run with no new item starts no container. |
+| `feeds.timeout` | `30s` | Time limit for the fetch of one feed. |
+| `feeds.maxAge` | `168h` | An item published longer ago than this is recorded as seen and never goes to a run. A feed that rotates old entries would otherwise show them as new. An item without a date counts as fresh. |
+| `feeds.maxRunsPerDay` | `12` | Cap on the scheduled feed runs that start the model in any 24 hours. A tick past the cap is recorded as `skipped` with the reason `ratelimit`, and its items wait for a later tick. `0` means no cap. Full runs and manual runs do not count and are not held back. |
 
 Exactly one of `outputSchema` and `outputSchemaFile` is necessary. ais compiles the schema when it loads the task.
 
@@ -710,6 +718,8 @@ The `prompt` uses the Go `text/template` syntax. A reference to a missing key is
 | `.Groups` | List of groups. Each group has `.Fields`, `.Count`, and `.Collected`. `.Collected` maps a column from `expose.prompt.collect` to its list of values. The list is empty unless `expose.prompt.groupBy` is set. |
 | `.Records` | The records after the field policy. Each record has `.Fields`. |
 | `.Task` | The task. |
+| `.Mode` | `feed` or `full`. A task without `feeds` always has `full`. |
+| `.Feed` | The new feed items of a feed run. Each item has `.Source`, `.Title`, `.Link`, `.Summary`, and `.Published`. The list is empty in a full run. |
 
 The functions are `join`, `lower`, `upper`, and `json`.
 
@@ -725,13 +735,51 @@ Each rule has three keys:
 The new field holds a list with one object for each inventory record that matches. The list can be empty.
 To attach `count`, list `count: clear` in `fields`. The template `vuln-watch` attaches `[title, count, hostname, ip, site]`.
 
+### Feed checks
+
+A feed check saves tokens. The host reads the feeds, and the model gets only the items that are new. An hour without a new item starts no container.
+The task key `feeds` turns this on. A task without `feeds` always does the full check, as before.
+
+A run has one of two modes:
+
+| Mode | Starts at | What the model does |
+|---|---|---|
+| `feed` | A tick of `schedule`. | It works only on the new items in `.Feed`. |
+| `full` | A tick of `feeds.fullSchedule`. | It does the complete check with web search. |
+
+If a tick of `schedule` and a tick of `feeds.fullSchedule` come due in the same minute, one run starts, and it is a full run.
+`ais run <task>` is a feed run for a task with `feeds`. `ais run --full <task>` does the full check.
+The prompt of the template `vuln-watch` has the form `{{ if eq .Mode "feed" }}...{{ else }}...{{ end }}`. In a feed run, the model skips by title the items that cannot concern the inventory. It fetches and verifies the other items. It uses `WebSearch` only to find the vendor advisory of one item.
+
+The host does these steps before a feed run:
+
+1. Fetch all feeds, at most four at a time. `feeds.timeout` limits each fetch. Items older than `feeds.maxAge` are recorded as seen.
+2. Remove duplicates. The key of an item is a hash of its GUID, else of its link, else of its title.
+3. Store the items in the table `feed_items` of `ais.db`, with the state `new`, `handed`, or `seen`.
+4. Give the items in the state `new` to the run, newest first, up to `feeds.maxItems`. These are the items that are new in this fetch, and the items of an earlier run that failed.
+
+If the run succeeds, its items become `seen`. If the run fails, leaks, or times out, its items become `new` again, and the next feed run gets them.
+The retention job deletes `seen` items that are older than `retention.keepDays`. An item that a feed still lists after that is new again.
+
+If a feed fails, ais logs a warning and skips that feed. The run uses the other feeds. If every feed fails, the run fails.
+If no item is new and `feeds.skipWhenQuiet` is `true`, the daemon starts no container. It records a run in the state `skipped` with the reason `quiet`. The error text names the counts, for example `22 feed(s), 480 item(s), none new`. A quiet run costs nothing. The digest counts it as `quiet`.
+
+`feeds.maxRunsPerDay` bounds what a broken feed can cost. If a feed gives every item a new id or link on each fetch, every tick has new items. The daemon counts the scheduled feed runs of the last 24 hours that started the model. At the cap, it records the tick as `skipped` with the reason `ratelimit`, releases the items for a later tick, and starts no container. It also logs a warning when a feed with five or more items returns only new items, because that is the sign of unstable ids.
+
+The daemon fetches the feeds on the host, not in the container. `egress.allow` does not apply to the feed URLs. The container still needs each host of an item link that the model fetches in `egress.allow`.
+A source without a usable feed needs the full run. The daily full run of the template covers these sources.
+
+To test the feeds of a task, run `ais feeds test vuln-watch`. To see what the next feed run would get, run `ais run --dry-run vuln-watch`. Neither command claims an item. Before the first feed check of a task, run `ais feeds seen vuln-watch`: it marks every item that the feeds hold now as seen, so the first check reports only what appears after that, instead of the whole backlog.
+To use feed checks in an existing task, add the `feeds` block and the two-mode prompt from the template. You can also install the template again with `ais templates use vuln-watch --force`.
+
 ## Commands
 
 | Command | Meaning |
 |---|---|
 | `ais daemon` | Run the scheduler, the backend, and the sink dispatcher in the foreground. |
 | `ais run <task>` | Run one task now. The trigger is `manual`. |
-| `ais run --dry-run <task>` | Write the input files, print the container command and the file list, and start nothing. |
+| `ais run --dry-run <task>` | Write the input files, print the container command and the file list, and start nothing. For a task with `feeds`, it first prints each feed with its item count or error. Then it prints the new items, or says that the daemon would record a quiet run. It claims no item. |
+| `ais run --full <task>` | For a task with `feeds`, do the full check with web search and not the feed check. |
 | `ais run --engine E <task>` | Use the engine `docker` or `podman` for this run. |
 | `ais run --live <task>` | Show the progress of the run on standard error while it runs. `--follow` is an alias. See Live runs. |
 | `ais run --json <task>` | Print the run, the clear result, and the leaks as JSON. |
@@ -749,6 +797,8 @@ To attach `count`, list `count: clear` in `fields`. The template `vuln-watch` at
 | `ais templates show <name>` | Print the description and the task file of a template. |
 | `ais templates use <name>` | Copy a template into the tasks directory. It sets the task name and the inventory path, and checks the task. `--as NAME` sets another task name. `--force` replaces an existing file. |
 | `ais digest <task>` | Build the digest for the window that ends now and send it to the sinks of the task at once. ais tries once and does not queue it. `--print` prints the Webex markdown and sends nothing. `--window D` sets the window, as a duration such as `24h` or `168h`. Default: `digest.window` of the task, or `24h` if the task has no `digest` key. It works for a task without a `digest` key. |
+| `ais feeds test <task>` | Fetch the feeds of the task and print the table `FEED`, `ITEMS`, `NEWEST`, and `STATUS`. Then print the number of distinct items and the number of new items for the next feed check. `--items` lists the new items. It claims no item. |
+| `ais feeds seen <task>` | Fetch the feeds of the task and mark every item as seen, without a run. Use it once before the first feed check, so the backlog does not go to the model. |
 | `ais runs redeliver <run-id>` | Queue all deliveries of the run again. `--sink S` limits it to one sink. |
 | `ais image build` | Build the run image from the recipe in the binary. `--no-cache` ignores the layer cache. |
 | `ais image status` | Print whether the image exists and matches the recipe of this binary. |
@@ -1041,6 +1091,7 @@ Set `AIS_LOG_FORMAT=json` for JSON logs on standard error.
 - A schedule is a cron expression with five fields, or a descriptor such as `@hourly`. The timezone is `scheduler.timezone`.
 - The scheduler adds a random delay between zero and the jitter to each tick.
 - If a run of the same task is active, the new run is `skipped` with the reason `overlap`.
+- A task with `feeds` has a second schedule, `feeds.fullSchedule`. A tick of it starts a full run. If both schedules are due in the same minute, one full run starts. See Feed checks.
 - `scheduler.maxParallel` limits the runs at the same time.
 - If `scheduler.dailyBudgetUsd` is more than 0, the scheduler adds up the cost since midnight in the scheduler timezone. When the sum reaches the limit, the scheduler records a `skipped` run with the reason `budget`. This limit does not apply to `ais run`.
 - The scheduler does not replay ticks that it missed while the daemon was off.
@@ -1121,6 +1172,8 @@ The `Reason` column of `ais runs list` has one of these values:
 | `timeout` | The time limit passed. |
 | `leak` | The leak check found a value. |
 | `redaction` | The redaction policy is not approved (`skipped`). |
+| `quiet` | A feed check found no new item, so ais started no container (`skipped`). |
+| `ratelimit` | A feed check had new items, but the task reached `feeds.maxRunsPerDay`, so ais started no container (`skipped`). The items wait for a later tick. |
 | `model` | Claude Code reported an error. |
 
 ### Delivery and redelivery
@@ -1143,6 +1196,7 @@ The NATS sink sets a message ID of the form `<run-id>/<kind>/<sink>`. JetStream 
 
 Once an hour, the daemon deletes finished runs of each task. It deletes the runs beyond `retention.keepRuns` and the runs older than `retention.keepDays`.
 It removes the database rows and the run directories. Runs that are `queued` or `running` stay.
+The same job deletes feed items in the state `seen` that are older than `retention.keepDays`. If `retention.keepDays` is `0`, it keeps them.
 
 ### Image
 

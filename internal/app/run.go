@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"github.com/scuq/ais/internal/output"
 	"github.com/scuq/ais/internal/runner"
 	"github.com/scuq/ais/internal/runtime"
+	"github.com/scuq/ais/internal/scheduler"
 	"github.com/scuq/ais/internal/secret"
 	"github.com/scuq/ais/internal/store"
 	"github.com/scuq/ais/internal/task"
@@ -32,12 +34,13 @@ func cmdRun(ctx context.Context, p *output.Printer, args []string) int {
 	noBuild := fs.Bool("no-autobuild", false, "fail instead of building a missing or stale image")
 	live := fs.Bool("live", false, "stream the model's progress (text, tool calls, results) while the run executes")
 	fs.BoolVar(live, "follow", false, "alias for --live")
+	full := fs.Bool("full", false, "for a task with feeds: the full check with web search instead of the feed check")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return 2
 	}
 	if len(pos) != 1 {
-		p.Error("usage: ais run [--dry-run] [--live] [--engine docker|podman] [--json] <task>")
+		p.Error("usage: ais run [--dry-run] [--live] [--full] [--engine docker|podman] [--json] <task>")
 		return 2
 	}
 	taskName := pos[0]
@@ -67,6 +70,11 @@ func cmdRun(ctx context.Context, p *output.Printer, args []string) int {
 	if *live {
 		opts.Live = os.Stderr
 	}
+	trigger := scheduler.TriggerManual
+	if *full {
+		trigger = scheduler.TriggerManualFull
+	}
+	opts.Trigger = trigger
 	if *dryRun {
 		return dryRunTask(ctx, p, cfg, t, opts)
 	}
@@ -100,7 +108,7 @@ func cmdRun(ctx context.Context, p *output.Printer, args []string) int {
 			p.Warn("backend sidecar is not running: the inventory MCP server will be unreachable from the container (start 'ais daemon' or 'ais net up')")
 		}
 	}
-	out, err := r.Run(ctx, t, "manual")
+	out, err := r.Run(ctx, t, trigger)
 	if err != nil {
 		p.Error("%s", err)
 		return 1
@@ -127,10 +135,40 @@ func cmdRun(ctx context.Context, p *output.Printer, args []string) int {
 }
 
 func dryRunTask(ctx context.Context, p *output.Printer, cfg *config.Config, t *task.Task, opts runner.Options) int {
+	// A dry run of a feed check reads the feeds and shows what a run would
+	// get, but claims nothing: the next real run still gets the items.
+	opts.Peek = true
+	if t.Feeds != nil {
+		if st, err := store.Open(filepath.Join(cfg.StateDir(), "ais.db")); err == nil {
+			defer st.Close()
+			opts.Feeds = st
+		}
+	}
 	prep, err := runner.Prepare(ctx, cfg, t, runner.EphemeralSalt{}, opts)
+	for _, f := range prep.Feeds {
+		if f.Err != "" {
+			p.Warn("feed %s: %s", f.URL, f.Err)
+		} else {
+			p.Info("feed %s: %d item(s)", f.URL, f.Items)
+		}
+	}
+	if errors.Is(err, runner.ErrQuiet) {
+		p.Info("feed check: no new item; the daemon would record a quiet run and start no container")
+		return 0
+	}
+	if errors.Is(err, runner.ErrRateLimited) {
+		p.Warn("feed check: %v; the daemon would record a skipped run (ratelimit) and start no container", err)
+		return 0
+	}
 	if err != nil {
 		p.Error("%s", err)
 		return 1
+	}
+	if prep.Mode == "feed" {
+		p.Info("feed check: %d new item(s) go to the model", len(prep.Feed))
+		for _, it := range prep.Feed {
+			fmt.Fprintf(os.Stdout, "#   %s: %s — %s\n", it.Source, it.Title, it.Link)
+		}
 	}
 	pl := prep.PromptLog()
 	pl.RunID += "-dry"

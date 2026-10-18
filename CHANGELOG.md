@@ -3,6 +3,26 @@
 All notable changes to this project are in this file.
 The format follows Keep a Changelog.
 
+## [0.6.0] - 2026-10-18
+
+### Added
+
+- The task key `feeds` with `urls`, `fullSchedule`, `maxItems` (default `150`), `skipWhenQuiet` (default `true`), and `timeout` (default `30s`). Before a feed run, the host reads the RSS, Atom, and RDF feeds and the CISA KEV JSON catalog. It gives the model only the items that no earlier run evaluated. A task without `feeds` works as before.
+- A tick of `schedule` is a feed run, and a tick of `feeds.fullSchedule` is a full run with web search. If both are due in the same minute, one full run starts. The prompt template has the new values `.Mode` (`feed` or `full`) and `.Feed`.
+- The reason `quiet`. If a feed run finds no new item and `skipWhenQuiet` is `true`, the daemon starts no container. It records a run in the state `skipped` with the reason `quiet`.
+- The digest counts quiet runs separately: `N quiet` in the runs line and the field `digest.quiet` in the event.
+- The command `ais run --full <task>` does the full check for a task with `feeds`. The command `ais run --dry-run <task>` prints each feed and the new items, and claims no item.
+- The command `ais feeds test [--items] <task>` fetches the feeds and prints the items and the status of each feed, and the number of new items. It claims no item.
+- The key `feeds.maxAge` (default `168h`): an older item is recorded as seen and never goes to a run.
+- The key `feeds.maxRunsPerDay` (default `12`): the cap on scheduled feed runs that start the model in 24 hours. A tick past the cap is recorded as `skipped` with the new reason `ratelimit`, and its items wait. Full and manual runs do not count. The daemon logs a warning when a feed returns only new items, the sign of unstable ids. The table `runs` gains the column `mode`; ais adds it to an existing database at start. Runs from before this version have no mode and do not count.
+- The command `ais feeds seen <task>` marks every current feed item as seen, so that the first feed check of a task reports only what appears after that.
+- The table `feed_items` in `ais.db`. The retention job deletes `seen` items that are older than `retention.keepDays`.
+
+### Changed
+
+- The template `vuln-watch` runs feed checks every 20 minutes from 06 to 22 (`7,27,47 6-22 * * *`) instead of about once an hour, because a check without a new item costs nothing. The full run stays at 20:07. Existing task files keep their schedule.
+- The template `vuln-watch` has a `feeds` block with 22 feed URLs and `fullSchedule: "7 20 * * *"`. The feed runs use only the new items. The full run at 20:07 does the complete check, and it covers the sources without a feed. The prompt has a feed mode and a full mode. To get this in an existing task, add the `feeds` block and the prompt from the template, or run `ais templates use vuln-watch --force`. A task that you do not change works as before.
+
 ## [0.5.0] - 2026-10-17
 
 ### Added
