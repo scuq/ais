@@ -14,6 +14,7 @@ import (
 
 	"github.com/scuq/ais/internal/config"
 	"github.com/scuq/ais/internal/secret"
+	"github.com/scuq/ais/internal/store"
 )
 
 // webex posts a formatted message to a Webex space, either through an
@@ -307,8 +308,8 @@ func WebexMarkdown(title string, ev Event, maxItems int) string {
 }
 
 // digestMarkdown renders a digest event: the headline says whether the
-// window had findings, the second line says what the runs did, the footer
-// gives the summed usage and the next run.
+// window had findings, the body lines give the figures of `aisctl report`
+// for the window, the footer gives the time and the next run.
 func digestMarkdown(title string, ev Event, when string) string {
 	dg := ev.Digest
 	if dg == nil {
@@ -316,20 +317,151 @@ func digestMarkdown(title string, ev Event, when string) string {
 	}
 	var b strings.Builder
 	if dg.Findings == 0 {
-		fmt.Fprintf(&b, "✅ **%s**: nothing found in the last %s\n", title, dg.WindowLabel())
+		fmt.Fprintf(&b, "✅ **%s**: %s\n", title, digestHeadline(dg))
 	} else {
-		fmt.Fprintf(&b, "🔎 **%s**: %d finding(s) in the last %s\n", title, dg.Findings, dg.WindowLabel())
+		fmt.Fprintf(&b, "🔎 **%s**: %s\n", title, digestHeadline(dg))
 	}
-	b.WriteString(digestStats(dg, ev))
-	fmt.Fprintf(&b, "\n_%s · %s", when, costLine(ev))
-	if dg.NextRun != nil {
-		fmt.Fprintf(&b, " · next run %s", dg.NextRun.Local().Format("2006-01-02 15:04"))
+	for _, line := range digestLines(dg, ev) {
+		b.WriteString(line + "\n")
 	}
+	fmt.Fprintf(&b, "_%s", digestFooter(dg, ev, when))
 	b.WriteString("_")
 	return b.String()
 }
 
-// digestStats is the middle line of a digest: runs, turns, checked items.
+// digestHeadline is "nothing found in the last 24 h", or the count of new
+// findings and updates.
+func digestHeadline(dg *Digest) string {
+	if dg.Findings == 0 {
+		return "nothing found in the last " + dg.WindowLabel()
+	}
+	var parts []string
+	if n := dg.Findings - dg.Updates; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d finding(s)", n))
+	}
+	if dg.Updates > 0 {
+		parts = append(parts, fmt.Sprintf("%d update(s)", dg.Updates))
+	}
+	return strings.Join(parts, ", ") + " in the last " + dg.WindowLabel()
+}
+
+// digestFooter is the time of the digest and the next run. A digest
+// without stats (built by an older version) keeps the usage in the
+// footer.
+func digestFooter(dg *Digest, ev Event, when string) string {
+	footer := when
+	if dg.Stats == nil {
+		footer += " · " + costLine(ev)
+	}
+	if dg.NextRun != nil {
+		footer += " · next run " + dg.NextRun.Local().Format("2006-01-02 15:04")
+	}
+	return footer
+}
+
+// digestLines are the body lines of a digest, one per area: runs, feeds,
+// prefilter, model, tokens, cost. A line without figures is left out, and
+// so is a zero part of a line.
+func digestLines(dg *Digest, ev Event) []string {
+	s := dg.Stats
+	if s == nil {
+		return []string{digestStats(dg, ev)}
+	}
+	var lines []string
+	line := func(label string, parts []string) {
+		if len(parts) > 0 {
+			lines = append(lines, "**"+label+"** "+strings.Join(parts, " · "))
+		}
+	}
+	// nz formats a count, or returns "" for zero.
+	nz := func(n int, format string) string {
+		if n == 0 {
+			return ""
+		}
+		return fmt.Sprintf(format, n)
+	}
+	keep := func(parts ...string) []string {
+		var out []string
+		for _, p := range parts {
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+
+	t := s.Ticks
+	model := fmt.Sprintf("%d model run(s)", s.Model.Runs)
+	if outcome := keep(nz(t.Succeeded, "%d ok"), nz(t.Failed, "%d failed")); len(outcome) > 0 {
+		model += " (" + strings.Join(outcome, ", ") + ")"
+	}
+	line("Runs", keep(fmt.Sprintf("%d tick(s)", t.Total), model, nz(t.Quiet, "%d quiet"), nz(t.RateLimit, "%d capped"), nz(t.Skipped+t.Running, "%d skipped")))
+
+	if f := s.Feeds; f.Measured > 0 {
+		line("Feeds", keep(fmt.Sprintf("%d fetches", f.Fetches), fmt.Sprintf("%s items", humanTokens(int64(f.Items))), fmt.Sprintf("%d new", f.New), nz(f.Filtered, "%d withheld"), nz(f.Failed, "%d feed error(s)")))
+	}
+
+	if p := s.Prefilter; p.Runs > 0 {
+		kept := fmt.Sprintf("%d kept / %d dropped", p.Kept, p.Dropped)
+		if total := p.Kept + p.Dropped; total > 0 {
+			kept += fmt.Sprintf(" (%.0f %%)", 100*float64(p.Dropped)/float64(total))
+		}
+		line("Prefilter", keep(fmt.Sprintf("%d scored", p.Scored), kept, nz(p.Keyword, "%d keyword hit(s)"), nz(p.Errors, "%d error(s)")))
+	}
+
+	m := s.Model
+	if m.Runs > 0 {
+		var checked string
+		if dg.Checked != nil {
+			checked = fmt.Sprintf("%d items checked", *dg.Checked)
+		}
+		names := make([]string, len(m.Models))
+		for i, name := range m.Models {
+			names[i] = strings.TrimPrefix(name, "claude-")
+		}
+		var avg string
+		if m.Wall > 0 {
+			avg = "avg " + (m.Wall / time.Duration(m.Runs)).Round(time.Second).String() + "/run"
+		}
+		line("Model", keep(strings.Join(names, ", "), fmt.Sprintf("%d turns", m.Turns), checked, avg))
+		if in := m.In(); in+m.Output > 0 {
+			tokens := humanTokens(in) + " in"
+			if m.CacheRead > 0 {
+				tokens += fmt.Sprintf(" (%.0f %% cache read)", 100*float64(m.CacheRead)/float64(in))
+			}
+			line("Tokens", []string{tokens + " / " + humanTokens(m.Output) + " out"})
+		}
+	}
+
+	if m.CostUSD > 0 {
+		subscription := ev.Meta.Billing == "" || ev.Meta.Billing == config.Billing
+		cost := fmt.Sprintf("$%.2f", m.CostUSD)
+		if subscription {
+			cost = "est. " + cost
+		}
+		parts := []string{cost, fmt.Sprintf("$%.2f/run", m.CostUSD/float64(m.Runs))}
+		// The split by model shows only when it covers every run, so
+		// that it never adds up to less than the total.
+		if len(m.ByModel) > 1 && m.Unsplit == (store.ModelTokens{}) {
+			names := make([]string, 0, len(m.ByModel))
+			for name := range m.ByModel {
+				names = append(names, name)
+			}
+			sort.Slice(names, func(i, j int) bool { return m.ByModel[names[i]].CostUSD > m.ByModel[names[j]].CostUSD })
+			for _, name := range names {
+				parts = append(parts, fmt.Sprintf("%s $%.2f", strings.TrimPrefix(name, "claude-"), m.ByModel[name].CostUSD))
+			}
+		}
+		if subscription {
+			parts[len(parts)-1] += " (subscription)"
+		}
+		line("Cost", parts)
+	}
+	return lines
+}
+
+// digestStats is the middle line of a digest without stats: runs, turns,
+// checked items.
 func digestStats(dg *Digest, ev Event) string {
 	parts := []string{dg.RunsLine(), fmt.Sprintf("%d turns", ev.Meta.NumTurns)}
 	if dg.Checked != nil {
@@ -520,12 +652,15 @@ func WebexCard(title string, ev Event, maxItems int) map[string]any {
 	fs, ok := findings(ev.Result)
 	switch {
 	case ev.Kind == "digest" && ev.Digest != nil:
-		head, color := fmt.Sprintf("Nothing found in the last %s", ev.Digest.WindowLabel()), "Good"
+		color := "Good"
 		if ev.Digest.Findings > 0 {
-			head, color = fmt.Sprintf("%d finding(s) in the last %s", ev.Digest.Findings, ev.Digest.WindowLabel()), "Accent"
+			color = "Accent"
 		}
-		body = append(body, map[string]any{"type": "TextBlock", "text": head, "wrap": true, "color": color},
-			map[string]any{"type": "TextBlock", "text": digestStats(ev.Digest, ev), "wrap": true})
+		head := digestHeadline(ev.Digest)
+		body = append(body, map[string]any{"type": "TextBlock", "text": strings.ToUpper(head[:1]) + head[1:], "wrap": true, "color": color})
+		for _, line := range digestLines(ev.Digest, ev) {
+			body = append(body, map[string]any{"type": "TextBlock", "text": line, "wrap": true, "spacing": "None"})
+		}
 	case ev.Kind == "alert":
 		body = append(body, map[string]any{"type": "TextBlock", "text": fmt.Sprintf("Run %s %s (%s)", ev.RunID, ev.State, ev.Reason), "wrap": true, "color": "Attention"})
 		if ev.Error != "" {
@@ -589,10 +724,7 @@ func WebexCard(title string, ev Event, maxItems int) map[string]any {
 	}
 	footer := fmt.Sprintf("%s · run %s · %d turns · %s", ev.FinishedAt.Local().Format("2006-01-02 15:04"), ev.RunID, ev.Meta.NumTurns, costLine(ev))
 	if ev.Kind == "digest" && ev.Digest != nil {
-		footer = fmt.Sprintf("%s · %s", ev.FinishedAt.Local().Format("2006-01-02 15:04"), costLine(ev))
-		if ev.Digest.NextRun != nil {
-			footer += " · next run " + ev.Digest.NextRun.Local().Format("2006-01-02 15:04")
-		}
+		footer = digestFooter(ev.Digest, ev, ev.FinishedAt.Local().Format("2006-01-02 15:04"))
 	}
 	body = append(body, map[string]any{"type": "TextBlock", "isSubtle": true, "size": "Small", "wrap": true, "text": footer})
 	card := map[string]any{

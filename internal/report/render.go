@@ -3,9 +3,12 @@ package report
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/scuq/ais/internal/store"
 )
 
 // Render writes the report as text: one column per window, one row per
@@ -98,6 +101,39 @@ func Render(w io.Writer, rep Report) error {
 	row("container CPU", func(s Stats) string { return measured(dur(s.Model.CPU), s.Model.Measured, s.Model.Runs) })
 	row("peak memory", func(s Stats) string { return size(s.Model.MemPeak) })
 
+	if split := splitModels(rep); len(split) > 0 {
+		section("BY MODEL")
+		tokenRows := func(get func(Stats) (store.ModelTokens, bool)) {
+			cell := func(f func(store.ModelTokens) string) func(Stats) string {
+				return func(s Stats) string {
+					t, ok := get(s)
+					if !ok {
+						return "-"
+					}
+					return f(t)
+				}
+			}
+			row("  uncached", cell(func(t store.ModelTokens) string { return tok(t.Input) }))
+			row("  cache read", cell(func(t store.ModelTokens) string { return tok(t.CacheRead) }))
+			row("  cache write", cell(func(t store.ModelTokens) string { return tok(t.CacheCreation) }))
+			row("  tokens out", cell(func(t store.ModelTokens) string { return tok(t.Output) }))
+			row("  est. cost", cell(func(t store.ModelTokens) string { return usd(t.CostUSD) }))
+		}
+		for _, name := range split {
+			section(name)
+			tokenRows(func(s Stats) (store.ModelTokens, bool) {
+				t, ok := s.Model.ByModel[name]
+				return t, ok
+			})
+		}
+		if hasUnsplit(rep) {
+			section("not split (older runs)")
+			tokenRows(func(s Stats) (store.ModelTokens, bool) {
+				return s.Model.Unsplit, s.Model.Unsplit != (store.ModelTokens{})
+			})
+		}
+	}
+
 	section("RESULTS")
 	row("results", func(s Stats) string { return n(s.Results.Runs) })
 	row("new findings", func(s Stats) string { return n(s.Results.Findings) })
@@ -126,6 +162,9 @@ func Render(w io.Writer, rep Report) error {
 	}
 	if len(models) > 0 {
 		fmt.Fprintf(w, "\nmodels: %s\n", strings.Join(models, ", "))
+	}
+	if len(splitModels(rep)) > 0 {
+		fmt.Fprintln(w, "MODEL tokens add up every model of a run; BY MODEL splits them (a helper model, such as the one behind WebFetch, can add many cheap uncached tokens).")
 	}
 	fmt.Fprintln(w, "CPU and memory come from the containers' cgroups; \"x of y\" means only x runs reported them (older runs and images did not).")
 	if len(rep.Runs) > 0 {
@@ -176,6 +215,37 @@ func RenderRuns(w io.Writer, rep Report) error {
 			r.StartedAt.Local().Format("01-02 15:04"), r.Task, dash(r.Mode), outcome, feeds, newItems, pf, model, turns, tokens, cost, cpu, size(mem))
 	}
 	return tw.Flush()
+}
+
+// splitModels returns the models of the BY MODEL section, the most
+// expensive in the longest window first.
+func splitModels(rep Report) []string {
+	cost := map[string]float64{}
+	for _, win := range rep.Windows {
+		for name, t := range win.Stats.Model.ByModel {
+			cost[name] = max(cost[name], t.CostUSD)
+		}
+	}
+	names := make([]string, 0, len(cost))
+	for name := range cost {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if cost[names[i]] != cost[names[j]] {
+			return cost[names[i]] > cost[names[j]]
+		}
+		return names[i] < names[j]
+	})
+	return names
+}
+
+func hasUnsplit(rep Report) bool {
+	for _, win := range rep.Windows {
+		if win.Stats.Model.Unsplit != (store.ModelTokens{}) {
+			return true
+		}
+	}
+	return false
 }
 
 func contains(list []string, s string) bool {

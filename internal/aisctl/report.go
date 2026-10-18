@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/scuq/ais/internal/claude"
 	"github.com/scuq/ais/internal/config"
 	"github.com/scuq/ais/internal/report"
+	"github.com/scuq/ais/internal/runner"
 	"github.com/scuq/ais/internal/store"
 )
 
@@ -66,6 +69,7 @@ func Report(ctx context.Context, e *Env, o ReportOptions) error {
 	if err != nil {
 		return err
 	}
+	fillModelUsage(runs)
 	results, err := st.ResultsSince(ctx, o.Task, since)
 	if err != nil {
 		return err
@@ -97,6 +101,27 @@ func Report(ctx context.Context, e *Env, o ReportOptions) error {
 			du.Since.Local().Format("2006-01-02 15:04"), du.CPU.Round(time.Millisecond), du.Memory>>20, du.MemPeak>>20)
 	}
 	return nil
+}
+
+// fillModelUsage gives runs from before the per-model split their split
+// from the envelope saved in the run directory. A run without one stays
+// unsplit.
+func fillModelUsage(runs []store.Run) {
+	for i := range runs {
+		r := &runs[i]
+		if len(r.ModelUsage) > 0 || r.Dir == "" {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(r.Dir, "stdout.json"))
+		if err != nil {
+			continue
+		}
+		env, err := claude.ParseEnvelope(raw)
+		if err != nil {
+			continue
+		}
+		r.ModelUsage = runner.ModelTokens(env)
+	}
 }
 
 // readDaemonUsage asks systemd for the unit's accounting.

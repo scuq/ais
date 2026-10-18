@@ -35,6 +35,10 @@ func TestRunLifecycle(t *testing.T) {
 	r.State, r.FinishedAt, r.CostUSD, r.NumTurns = StateSucceeded, now.Add(time.Minute), 0.5, 3
 	r.Model, r.Models = "claude-opus-5-5", "claude-opus-5-5,claude-haiku-5-5"
 	r.InputTokens, r.OutputTokens, r.CacheReadTokens, r.CacheCreationTokens = 100, 20, 300, 40
+	r.ModelUsage = map[string]ModelTokens{
+		"claude-opus-5-5":  {Input: 10, Output: 15, CacheRead: 300, CacheCreation: 40, CostUSD: 0.45},
+		"claude-haiku-5-5": {Input: 90, Output: 5, CostUSD: 0.05},
+	}
 	if err := s.FinishRun(ctx, r); err != nil {
 		t.Fatal(err)
 	}
@@ -48,6 +52,9 @@ func TestRunLifecycle(t *testing.T) {
 	if got.Model != "claude-opus-5-5" || got.Models != "claude-opus-5-5,claude-haiku-5-5" ||
 		got.InputTokens != 100 || got.OutputTokens != 20 || got.CacheReadTokens != 300 || got.CacheCreationTokens != 40 {
 		t.Errorf("usage not round-tripped: %+v", got)
+	}
+	if len(got.ModelUsage) != 2 || got.ModelUsage["claude-haiku-5-5"] != r.ModelUsage["claude-haiku-5-5"] || got.ModelUsage["claude-opus-5-5"] != r.ModelUsage["claude-opus-5-5"] {
+		t.Errorf("model usage not round-tripped: %+v", got.ModelUsage)
 	}
 	if _, ok, _ := s.ActiveRun(ctx, "t"); ok {
 		t.Error("finished run still active")

@@ -80,9 +80,10 @@ This saves the turns that a new check of the same item costs. The sinks show
 only `findings`.
 
 Digest: the task key `digest` sends a summary at 22:30 (`scheduler.timezone`)
-when the results of the last 24 hours have no finding. The last run of the day
-is at 22:07. The digest shows the runs, the turns, and the items checked, so a
-day without findings is not silence. It goes to the `sinks`.
+every day, with or without findings (`digest.always: true`). The last run of the
+day is at 22:07. The digest shows the figures of `aisctl report` for the last
+24 hours: runs, feeds, prefilter, model, tokens, and cost. A day without
+findings is not silence. It goes to the `sinks`.
 
 Schedule: `7,27,47 6-22 * * *`. Each tick is a feed check, except the tick at 20:07, which is the full run (`feeds.fullSchedule`). A feed check without a new item starts no container and costs nothing, so the task runs every 20 minutes from 06 to 22 and not in the night; the first check of the day picks the night up. `feeds.maxRunsPerDay` (12) caps the feed checks that start the model in 24 hours, so that a feed with unstable item ids cannot start a run at every tick. Times are in `scheduler.timezone`. To change the schedule, use `ais tasks set vuln-watch schedule="..."`.
 

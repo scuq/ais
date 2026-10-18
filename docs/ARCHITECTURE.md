@@ -285,7 +285,7 @@ The daemon runs `digestLoop`. Every 30 seconds it reads the current tasks. For e
 
 `QueueDigest` in `internal/sink/digest.go` reads the finished runs of the window with `Store.RunsBetween`. Without `always`, it queues nothing if the sum of the `findings` arrays is not 0. It writes one row of kind `digest` for each sink in `sinks`, not `alerts`. The row hangs on the newest finished run of the window, or on the newest run of the task if the window has none. It stores the window in `payload`. If the task has no finished run, it returns a reason and the loop logs `digest not sent`.
 
-The dispatcher builds the digest event from `payload` at send time. The field `digest` has `window_start`, `window_end`, `runs`, `succeeded`, `failed`, `skipped`, `findings`, `checked`, and `next_run`. The field `meta` has sums over the runs of the window. `skipEmpty` does not skip a digest, and the Splunk sink does not split it.
+The dispatcher builds the digest event from `payload` at send time. The field `digest` has `window_start`, `window_end`, `runs`, `succeeded`, `failed`, `skipped`, `findings`, `checked`, `next_run`, `stats`, and `updates`. `stats` comes from `report.Build` over the runs and results of the window. `updates` counts the findings with `previously_reported`. The results come from `Store.ResultsSince`. The field `meta` has sums over the runs of the window. `skipEmpty` does not skip a digest, and the Splunk sink does not split it.
 
 `ais digest` builds the same event for the window that ends now and calls the sinks once, without the queue.
 

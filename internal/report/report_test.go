@@ -35,7 +35,11 @@ func TestBuild(t *testing.T) {
 		{ID: "f", Task: "t", Mode: "feed", State: store.StateSucceeded, StartedAt: at.Add(-time.Hour),
 			Feeds: 22, FeedItems: 905, FeedNew: 2, FetchMS: 1500,
 			PrefilterMS: 4000, PrefilterScored: 1, PrefilterKeyword: 1, PrefilterKept: 2, PrefilterCPUMS: 5000, PrefilterMemPeak: 800 << 20,
-			NumTurns: 3, InputTokens: 200, CacheCreationTokens: 50, OutputTokens: 20, CostUSD: 0.18, DurationMS: 12000, CPUMS: 3000, MemPeak: 300 << 20, Models: "claude-opus-5-5"},
+			NumTurns: 3, InputTokens: 200, CacheCreationTokens: 50, OutputTokens: 20, CostUSD: 0.18, DurationMS: 12000, CPUMS: 3000, MemPeak: 300 << 20, Models: "claude-opus-5-5,claude-haiku-5-5",
+			ModelUsage: map[string]store.ModelTokens{
+				"claude-opus-5-5":  {Input: 20, CacheCreation: 50, Output: 15, CostUSD: 0.17},
+				"claude-haiku-5-5": {Input: 180, Output: 5, CostUSD: 0.01},
+			}},
 		// Today: held back by the cap, and a prefilter error.
 		{ID: "r", Task: "t", Mode: "feed", State: store.StateSkipped, Reason: "ratelimit", StartedAt: at.Add(-30 * time.Minute), Feeds: 22, FeedItems: 905, PrefilterKept: 4, PrefilterError: "image missing"},
 		// Today: a config failure before any container.
@@ -57,10 +61,11 @@ func TestBuild(t *testing.T) {
 	if p := day.Prefilter; p.Runs != 3 || p.Errors != 1 || p.Scored != 4 || p.Keyword != 1 || p.Kept != 6 || p.Dropped != 3 || p.CPU != 14*time.Second || p.MemPeak != 900<<20 || p.Measured != 2 || p.Wall != 10*time.Second {
 		t.Errorf("prefilter: %+v", p)
 	}
-	if m := day.Model; m.Runs != 1 || m.Turns != 3 || m.In() != 250 || m.Output != 20 || m.CostUSD != 0.18 || m.CPU != 3*time.Second || m.MemPeak != 300<<20 || m.Measured != 1 {
+	if m := day.Model; m.Runs != 1 || m.Turns != 3 || m.In() != 250 || m.Output != 20 || m.CostUSD != 0.18 || m.CPU != 3*time.Second || m.MemPeak != 300<<20 || m.Measured != 1 || m.Unsplit != (store.ModelTokens{}) || len(m.ByModel) != 2 {
 		t.Errorf("model day: %+v", m)
 	}
-	if m := week.Model; m.Runs != 2 || m.Turns != 18 || m.In() != 1750 || math.Abs(m.CostUSD-0.68) > 1e-9 || m.Measured != 1 || strings.Join(m.Models, ",") != "claude-opus-5-5,claude-haiku-5-5" {
+	if m := week.Model; m.Runs != 2 || m.Turns != 18 || m.In() != 1750 || math.Abs(m.CostUSD-0.68) > 1e-9 || m.Measured != 1 || strings.Join(m.Models, ",") != "claude-opus-5-5,claude-haiku-5-5" ||
+		m.ByModel["claude-haiku-5-5"].Input != 180 || m.ByModel["claude-opus-5-5"].CacheCreation != 50 || m.Unsplit.Input != 1000 || m.Unsplit.CostUSD != 0.5 {
 		t.Errorf("model week: %+v", m)
 	}
 	if r := week.Results; r.Runs != 2 || r.Findings != 1 || r.Updates != 1 || r.Checked != 4 {
@@ -75,9 +80,13 @@ func TestBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	for _, want := range []string{"last 24h", "last 7d", "new items to model", "$0.18", "$0.68", "1 of 2", "900 MiB", "905/22", "subscription", "RUNS (last 24h)", "skipped (quiet)"} {
+	for _, want := range []string{"last 24h", "last 7d", "new items to model", "$0.18", "$0.68", "1 of 2", "900 MiB", "905/22", "subscription", "RUNS (last 24h)", "skipped (quiet)", "BY MODEL", "not split (older runs)", "$0.17"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("render lacks %q:\n%s", want, out)
 		}
+	}
+	// The most expensive model comes first.
+	if strings.Index(out, "claude-opus-5-5   ") > strings.Index(out, "claude-haiku-5-5   ") {
+		t.Errorf("opus not first in BY MODEL:\n%s", out)
 	}
 }

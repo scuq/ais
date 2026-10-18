@@ -79,7 +79,8 @@ func TestRunSucceedsAndEnriches(t *testing.T) {
 		t.Errorf("usage: %+v", out.Run)
 	}
 	stored, err := r.Store.GetRun(context.Background(), out.Run.ID)
-	if err != nil || stored.InputTokens != 1100 || stored.Models != out.Run.Models {
+	if err != nil || stored.InputTokens != 1100 || stored.Models != out.Run.Models ||
+		stored.ModelUsage["claude-haiku-5-5"] != (store.ModelTokens{Input: 1000, Output: 200, CostUSD: 0.02}) || stored.ModelUsage["claude-opus-5-5"].CacheRead != 500 {
 		t.Errorf("stored usage: %+v err %v", stored, err)
 	}
 	clear := out.Clear.(map[string]any)

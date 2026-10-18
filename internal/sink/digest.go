@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/scuq/ais/internal/config"
+	"github.com/scuq/ais/internal/report"
 	"github.com/scuq/ais/internal/store"
 	"github.com/scuq/ais/internal/task"
 )
@@ -29,10 +30,16 @@ type Digest struct {
 	Skipped  int `json:"skipped"`
 	Quiet    int `json:"quiet"`
 	Findings int `json:"findings"`
+	// Updates is the part of Findings that reports a change to an earlier
+	// finding (previously_reported).
+	Updates int `json:"updates"`
 	// Checked is the number of items in the checked lists of the results,
 	// when the task's output has such a list (vuln-watch does).
 	Checked *int       `json:"checked,omitempty"`
 	NextRun *time.Time `json:"next_run,omitempty"`
+	// Stats are the figures of `aisctl report` for the window: ticks,
+	// feeds, prefilter, model usage and cost.
+	Stats *report.Stats `json:"stats,omitempty"`
 }
 
 // DigestPayload is what a digest delivery stores: its window, and the next
@@ -45,10 +52,6 @@ type DigestPayload struct {
 
 // ErrNoRun means the task has no finished run to attach a digest to.
 var ErrNoRun = errors.New("digest: the task has no finished run")
-
-// maxDigestResults bounds the results read for one digest; the store caps
-// a larger limit anyway.
-const maxDigestResults = 200
 
 // BuildDigest reads the runs and results of task in the window and returns
 // the digest, the summed run metadata, and the id of the newest run in the
@@ -110,16 +113,18 @@ func BuildDigest(ctx context.Context, st *store.Store, taskName string, p Digest
 		}
 		anchor = latest[0].ID
 	}
-	results, err := st.RecentResults(ctx, taskName, p.WindowStart, maxDigestResults)
+	results, err := st.ResultsSince(ctx, taskName, p.WindowStart)
 	if err != nil {
 		return dg, meta, "", err
 	}
+	var inWindow []store.Result
 	var checked int
 	hasChecked := false
 	for _, res := range results {
 		if !res.FinishedAt.Before(p.WindowEnd) {
 			continue
 		}
+		inWindow = append(inWindow, res)
 		raw := res.ClearJSON
 		if raw == nil {
 			raw = res.PseudoJSON
@@ -130,12 +135,22 @@ func BuildDigest(ctx context.Context, st *store.Store, taskName string, p Digest
 		}
 		if arr, ok := doc["findings"].([]any); ok {
 			dg.Findings += len(arr)
+			for _, f := range arr {
+				if m, ok := f.(map[string]any); ok && m["previously_reported"] == true {
+					dg.Updates++
+				}
+			}
 		}
 		if arr, ok := doc["checked"].([]any); ok {
 			hasChecked = true
 			checked += len(arr)
 		}
 	}
+	// report.Build counts a run in a window that ends at its time; the
+	// store already bounded runs and results to [start, end).
+	span := p.WindowEnd.Sub(p.WindowStart)
+	rep := report.Build(taskName, p.WindowEnd, config.Billing, []report.Window{{Name: "digest", Span: span}}, runs, inWindow)
+	dg.Stats = &rep.Windows[0].Stats
 	if hasChecked {
 		dg.Checked = &checked
 	}

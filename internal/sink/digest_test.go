@@ -90,18 +90,24 @@ func TestQueueDigestAndRender(t *testing.T) {
 	}
 	md := WebexMarkdown("ais t", ev, 10)
 	for _, want := range []string{
-		"✅ **ais t**: nothing found in the last 24 h",
-		"4 run(s) (2 succeeded, 1 failed, 1 skipped) · 36 turns · 7 items checked",
-		"claude-opus-5-5, claude-haiku-5-5 · 800k in / 60k out · subscription (est. $2.50)",
-		"· next run " + next.Local().Format("2006-01-02 15:04"),
+		"✅ **ais t**: nothing found in the last 24 h\n",
+		"**Runs** 4 tick(s) · 3 model run(s) (2 ok, 1 failed) · 1 skipped\n",
+		"**Model** opus-5-5, haiku-5-5 · 36 turns · 7 items checked\n",
+		"**Tokens** 800k in / 60k out\n",
+		"**Cost** est. $2.50 · $0.83/run (subscription)\n",
+		"_" + end.Local().Format("2006-01-02 15:04") + " · next run " + next.Local().Format("2006-01-02 15:04") + "_",
 	} {
 		if !strings.Contains(md, want) {
 			t.Errorf("markdown missing %q:\n%s", want, md)
 		}
 	}
+	// No feed or prefilter figures in the window: no such lines.
+	if strings.Contains(md, "**Feeds**") || strings.Contains(md, "**Prefilter**") {
+		t.Errorf("empty lines rendered:\n%s", md)
+	}
 	card := WebexCard("ais t", ev, 10)
 	body := card["body"].([]any)
-	if len(body) != 4 || !strings.Contains(body[1].(map[string]any)["text"].(string), "Nothing found") {
+	if len(body) != 7 || !strings.Contains(body[1].(map[string]any)["text"].(string), "Nothing found") {
 		t.Errorf("card body: %v", body)
 	}
 	// skipEmpty leaves a digest alone.
@@ -135,13 +141,71 @@ func TestQueueDigestQuietOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if md := WebexMarkdown("ais t", ev, 10); !strings.Contains(md, "🔎 **ais t**: 1 finding(s) in the last 24 h") {
+	if md := WebexMarkdown("ais t", ev, 10); !strings.Contains(md, "🔎 **ais t**: 1 finding(s) in the last 24 h\n**Runs**") {
 		t.Errorf("markdown: %s", md)
 	}
 	// Without sinks nothing is queued, with a reason.
 	tk.Sinks = nil
 	if reason, _ := QueueDigest(ctx, st, tk, end, nil, end); reason != "task has no sinks" {
 		t.Errorf("no sinks: %q", reason)
+	}
+}
+
+// TestDigestStatsLines checks the lines of a feed task: ticks, feeds,
+// prefilter, model, tokens, and the cost split by model.
+func TestDigestStatsLines(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "ais.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	end := time.Date(2026, 10, 18, 20, 30, 0, 0, time.UTC)
+	add := func(r store.Run, fin store.Run) {
+		r.Task, r.State, r.Mode = "t", store.StateRunning, "feed"
+		if err := st.InsertRun(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+		fin.ID, fin.FinishedAt = r.ID, r.StartedAt.Add(time.Minute)
+		if err := st.FinishRun(ctx, fin); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add(store.Run{ID: "q1", StartedAt: end.Add(-5 * time.Hour), Feeds: 25, FeedItems: 1000, FeedsFailed: 1, FetchMS: 2000},
+		store.Run{State: store.StateSkipped, Reason: "quiet"})
+	add(store.Run{ID: "c1", StartedAt: end.Add(-4 * time.Hour)}, store.Run{State: store.StateSkipped, Reason: "ratelimit"})
+	add(store.Run{ID: "m1", StartedAt: end.Add(-3 * time.Hour), Feeds: 25, FeedItems: 1010, FeedNew: 10, FetchMS: 2000,
+		PrefilterMS: 5000, PrefilterScored: 9, PrefilterKeyword: 1, PrefilterKept: 6, PrefilterDropped: 4},
+		store.Run{State: store.StateSucceeded, NumTurns: 12, DurationMS: 130_000, InputTokens: 100_000, CacheReadTokens: 900_000, OutputTokens: 50_000, CostUSD: 1.20,
+			Models: "claude-opus-5-5,claude-haiku-5-5", Model: "claude-opus-5-5",
+			ModelUsage: map[string]store.ModelTokens{"claude-opus-5-5": {CostUSD: 1.00}, "claude-haiku-5-5": {CostUSD: 0.20}}})
+	_ = st.SaveResult(ctx, "m1", "t", end.Add(-3*time.Hour), []byte(`{"findings":[{"previously_reported":true},{}],"checked":[{},{}]}`), nil)
+	d := &Dispatcher{Store: st}
+	ev, err := d.LoadDigest(ctx, "t", DigestPayload{WindowStart: end.Add(-24 * time.Hour), WindowEnd: end})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Digest.Findings != 2 || ev.Digest.Updates != 1 || ev.Digest.Stats == nil {
+		t.Fatalf("digest: %+v", ev.Digest)
+	}
+	md := WebexMarkdown("ais t", ev, 10)
+	for _, want := range []string{
+		"🔎 **ais t**: 1 finding(s), 1 update(s) in the last 24 h\n",
+		"**Runs** 3 tick(s) · 1 model run(s) (1 ok) · 1 quiet · 1 capped\n",
+		"**Feeds** 3 fetches · 2.0k items · 10 new · 1 feed error(s)\n",
+		"**Prefilter** 9 scored · 6 kept / 4 dropped (40 %) · 1 keyword hit(s)\n",
+		"**Model** opus-5-5, haiku-5-5 · 12 turns · 2 items checked · avg 2m10s/run\n",
+		"**Tokens** 1.0M in (90 % cache read) / 50k out\n",
+		"**Cost** est. $1.20 · $1.20/run · opus-5-5 $1.00 · haiku-5-5 $0.20 (subscription)\n",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("markdown missing %q:\n%s", want, md)
+		}
+	}
+	// A digest without stats (an older payload) keeps the old line.
+	ev.Digest.Stats = nil
+	if md := WebexMarkdown("ais t", ev, 10); !strings.Contains(md, "3 run(s) (1 succeeded, 1 skipped, 1 quiet) · 12 turns · 2 items checked") || !strings.Contains(md, "subscription (est. $1.20)") {
+		t.Errorf("fallback:\n%s", md)
 	}
 }
 

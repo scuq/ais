@@ -97,6 +97,11 @@ type Model struct {
 	MemPeak       int64         `json:"memPeak"`
 	Measured      int           `json:"measured"`
 	Models        []string      `json:"models,omitempty"`
+	// ByModel splits the tokens and the cost by model. Unsplit holds the
+	// runs that recorded no split (older runs without a saved envelope),
+	// so that ByModel plus Unsplit adds up to the totals above.
+	ByModel map[string]store.ModelTokens `json:"byModel,omitempty"`
+	Unsplit store.ModelTokens            `json:"unsplit"`
 }
 
 // In is every input token: uncached input, cache reads and cache writes.
@@ -272,6 +277,17 @@ func add(s *Stats, r store.Run, seenModels map[string]bool) {
 			m.CPU += ms(r.CPUMS)
 			m.MemPeak = max(m.MemPeak, r.MemPeak)
 		}
+		if len(r.ModelUsage) == 0 {
+			addTokens(&m.Unsplit, store.ModelTokens{Input: r.InputTokens, Output: r.OutputTokens, CacheRead: r.CacheReadTokens, CacheCreation: r.CacheCreationTokens, CostUSD: r.CostUSD})
+		}
+		for name, u := range r.ModelUsage {
+			if m.ByModel == nil {
+				m.ByModel = map[string]store.ModelTokens{}
+			}
+			t := m.ByModel[name]
+			addTokens(&t, u)
+			m.ByModel[name] = t
+		}
 		names := strings.Split(r.Models, ",")
 		if r.Models == "" && r.Model != "" {
 			names = []string{r.Model}
@@ -283,6 +299,14 @@ func add(s *Stats, r store.Run, seenModels map[string]bool) {
 			}
 		}
 	}
+}
+
+func addTokens(t *store.ModelTokens, u store.ModelTokens) {
+	t.Input += u.Input
+	t.Output += u.Output
+	t.CacheRead += u.CacheRead
+	t.CacheCreation += u.CacheCreation
+	t.CostUSD += u.CostUSD
 }
 
 func startedModel(r store.Run) bool {

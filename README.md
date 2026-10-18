@@ -638,20 +638,38 @@ A task with no finished run gets no digest, and the daemon logs `digest not sent
 The event has `kind: digest`, `task`, `run_id` (the run of the delivery), `state: digest`, and `finished_at` (the window end). The field `digest` has these keys:
 
 - `window_start` and `window_end`.
-- `runs`, `succeeded`, `failed`, `skipped`, `quiet`, and `findings`. `failed` counts runs in the state `failed`, `leaked`, and `timeout`. `skipped` counts runs skipped because of overlap, and cancelled runs. `quiet` counts feed checks that found no new item (see Feed checks).
+- `runs`, `succeeded`, `failed`, `skipped`, `quiet`, `findings`, and `updates`. `updates` is the part of `findings` that has `previously_reported`. `failed` counts runs in the state `failed`, `leaked`, and `timeout`. `skipped` counts runs skipped because of overlap, and cancelled runs. `quiet` counts feed checks that found no new item (see Feed checks).
 - `checked`, only if the results have a `checked` list.
 - `next_run`.
+- `stats`, the figures of `aisctl report` for the window, in the same form as the `--json` output.
 
 The field `meta` has the sums over the runs of the window: `models` (each model once, in order of use), `tokens`, `cost_usd`, `num_turns`, and `duration_ms`.
 Webhook and NATS sinks receive the event as JSON. The Splunk `split` setting does not apply to a digest, so Splunk gets one event. `skipEmpty` does not apply to a digest.
 
 A Webex sink shows a digest like this:
 
-1. A headline: `✅ **<title>**: nothing found in the last 24 h`. With `always: true` and findings, it is `🔎 **<title>**: N finding(s) in the last 24 h`.
-2. A line such as `12 run(s) (11 succeeded, 1 failed) · 290 turns · 184 items checked`. A quiet run adds `N quiet` to the list in parentheses.
-3. A footer with the window end, the models, the tokens, the billing, and the next run, for example `<window end> · <models> · <in>k in / <out>k out · subscription (est. $x) · next run <time>`.
+1. A headline: `✅ **<title>**: nothing found in the last 24 h`. If the window has findings or updates, it is `🔎 **<title>**: N finding(s), M update(s) in the last 24 h`.
+2. One line for each area: `Runs`, `Feeds`, `Prefilter`, `Model`, `Tokens`, and `Cost`. These lines show the figures of `aisctl report` for the window. A line or a part with the value zero is left out.
+3. A footer with the window end and the next run, for example `<window end> · next run <time>`.
 
-With `card: true`, the Adaptive Card has the same content.
+The `Cost` line shows the estimated total and the cost for each run. It shows the split for each model only if every run in the window has a stored split.
+
+Example:
+
+```
+🔎 **ais vuln-watch**: 2 finding(s) in the last 24 h
+**Runs** 25 tick(s) · 11 model run(s) (11 ok) · 5 quiet · 9 capped
+**Feeds** 5 fetches · 3.3k items · 59 new
+**Prefilter** 53 scored · 13 kept / 46 dropped (78 %) · 6 keyword hit(s)
+**Model** opus-5-5, haiku-5-5 · 157 turns · 107 items checked · avg 1m25s/run
+**Tokens** 3.3M in (39 % cache read) / 232k out
+**Cost** est. $6.17 · $0.56/run (subscription)
+_2026-10-18 11:12 · next run 2026-10-18 11:27_
+```
+
+If the digest has no figures, the message has the old form: one line with the runs, the turns, and the items checked, and a footer with the usage.
+
+With `card: true`, the Adaptive Card has the same lines.
 
 CAUTION: The device names come from the enrich rules. A Webex message contains real hostnames by design. Send it only to a space that may see them.
 
@@ -1007,18 +1025,23 @@ The report has these sections:
 | `FEEDS (host)` | Fetches, fetches with figures, feeds read, feeds failed, items fetched, new items to the model, and items withheld by the prefilter. Also the fetch time (total, per fetch, longest). |
 | `PREFILTER (local model)` | Runs, errors, keyword hits, scored, kept, dropped, drop rate, wall time (total, per run, longest), CPU time, and peak memory. |
 | `MODEL (online)` | Runs, turns, tokens in (uncached, cache read, cache write), tokens out, estimated cost (total and per run), wall time, container CPU time, and peak memory. |
+| `BY MODEL` | One block for each model, the most expensive first, with the rows uncached, cache read, cache write, tokens out, and estimated cost. A last block, `not split (older runs)`, sums the runs without a split. |
 | `RESULTS` | Results, new findings, updates, and items checked. An update is a finding with `previously_reported`. |
 | `TOTAL` | Container CPU time, wall time, and estimated cost. |
 
 The sources of the figures are:
 
 - Tokens, turns, cost, and wall time of the model come from the result of Claude Code. Their rows go back to the first run.
+- The rows of `MODEL` add up all models of a run. Claude Code also uses a small helper model, for example to summarize the pages that `WebFetch` loads. Its tokens are never cached, so the uncached row can look large while the cost stays small. `BY MODEL` shows the split.
+- The split comes from the `modelUsage` block of the Claude Code result. ais stores it in the column `model_usage` of `runs`. For an older run, the report reads `stdout.json` in the run directory when it builds the report and writes nothing back. A run without `stdout.json` goes into `not split (older runs)`.
 - The dollar figures are estimates at API list prices. The billing line says `subscription`.
 - The feed and prefilter figures come from the host. `Prepared.UsageColumns` records them for every feed tick, also for `quiet` and `ratelimit` rows.
 - Both containers read their own cgroup v2 counters, `cpu.stat` (`usage_usec`) and `memory.peak`. This works with docker and podman, because each container has a private cgroup namespace.
 - The run container writes the counters to `out/usage.json` after `claude` exits. The prefilter container prints them in the field `usage` of its output.
 - The feed, prefilter, CPU, and memory figures start with the version that added them. Older rows have none.
 - In a CPU row, "x of y" means that only x of y runs reported CPU time and memory.
+
+`--json` has `byModel` and `unsplit` in the model figures of each window.
 
 `--runs` lists every run of the first window. The columns are:
 

@@ -419,6 +419,7 @@ func (r *Runner) execute(parent context.Context, prep *Prepared, env []string, r
 	u := env2.Tokens()
 	out.Run.InputTokens, out.Run.OutputTokens = u.InputTokens, u.OutputTokens
 	out.Run.CacheReadTokens, out.Run.CacheCreationTokens = u.CacheReadInputTokens, u.CacheCreationInputTokens
+	out.Run.ModelUsage = ModelTokens(env2)
 	if ms := env2.Models(); len(ms) > 0 {
 		// The model that did most of the work replaces the configured
 		// name, which can be an alias.
@@ -521,4 +522,17 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// ModelTokens returns the usage of each model in the envelope; nil when the
+// envelope has no modelUsage.
+func ModelTokens(env *claude.Envelope) map[string]store.ModelTokens {
+	if len(env.ModelUsage) == 0 {
+		return nil
+	}
+	out := make(map[string]store.ModelTokens, len(env.ModelUsage))
+	for name, u := range env.ModelUsage {
+		out[name] = store.ModelTokens{Input: u.InputTokens, Output: u.OutputTokens, CacheRead: u.CacheReadInputTokens, CacheCreation: u.CacheCreationInputTokens, CostUSD: u.CostUSD}
+	}
+	return out
 }

@@ -3,6 +3,24 @@
 All notable changes to this project are in this file.
 The format follows Keep a Changelog.
 
+## [Unreleased]
+
+## [0.8.0] - 2026-10-18
+
+### Added
+
+- The report of `aisctl report` has the section `BY MODEL`, after `MODEL (online)`. For each model, most expensive first, it shows the rows uncached, cache read, cache write, tokens out, and estimated cost. The `MODEL` rows add up all models, and a helper model such as the one behind `WebFetch` adds uncached tokens that cost little.
+- If a run has no stored split, the report reads `stdout.json` in the run directory when it builds the report. It writes nothing back. Runs without `stdout.json` appear under `not split (older runs)`.
+- The `--json` output of `aisctl report` has `byModel` and `unsplit` in the model figures of each window.
+- The table `runs` gains the column `model_usage`. It holds JSON with `input`, `output`, `cacheRead`, `cacheCreation`, and `costUsd` for each model, from the `modelUsage` block of the Claude Code result. ais adds the column to an existing database at start.
+
+### Changed
+
+- The digest carries the figures of `aisctl report` for its window. The Webex message has a headline and one line each for `Runs`, `Feeds`, `Prefilter`, `Model`, `Tokens`, and `Cost`, and then a footer with the window end and the next run. A line or a part with the value zero is left out. The Adaptive Card shows the same lines. A digest without figures keeps the old form.
+- The digest event has the new keys `digest.stats` and `digest.updates`. `updates` is the number of findings with `previously_reported`.
+- The digest reads all findings of the window. It no longer stops at 20 results.
+- The template `vuln-watch` sets `digest.always: true`, so the digest goes out every day, with or without findings.
+
 ## [0.7.0] - 2026-10-18
 
 ### Added

@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -74,6 +75,7 @@ CREATE TABLE IF NOT EXISTS runs (
   cache_read_tokens INTEGER NOT NULL DEFAULT 0,
   cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
   models TEXT NOT NULL DEFAULT '',
+  model_usage TEXT NOT NULL DEFAULT '',
   reason TEXT NOT NULL DEFAULT '',
   error TEXT NOT NULL DEFAULT '',
   mode TEXT NOT NULL DEFAULT '',
@@ -214,6 +216,8 @@ var runColumnsAdded = []struct{ name, def string }{
 	{"prefilter_error", "TEXT NOT NULL DEFAULT ''"},
 	{"cpu_ms", "INTEGER NOT NULL DEFAULT 0"},
 	{"mem_peak", "INTEGER NOT NULL DEFAULT 0"},
+	// The tokens and cost of each model as JSON; see Run.ModelUsage.
+	{"model_usage", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // deliveryColumnsAdded lists the columns added to deliveries after the
@@ -337,6 +341,9 @@ type Run struct {
 	OutputTokens        int64 `json:"outputTokens"`
 	CacheReadTokens     int64 `json:"cacheReadTokens"`
 	CacheCreationTokens int64 `json:"cacheCreationTokens"`
+	// ModelUsage splits the token counts and the cost by model. It is nil
+	// for runs from before the split was recorded.
+	ModelUsage map[string]ModelTokens `json:"modelUsage,omitempty"`
 	// Reason is a short machine-readable cause for failed/skipped/leaked:
 	// auth, schema, budget, turns, overlap, exit, engine, timeout.
 	Reason string `json:"reason"`
@@ -372,6 +379,15 @@ type Run struct {
 	MemPeak int64 `json:"memPeak,omitempty"`
 }
 
+// ModelTokens is the usage of one model in a run.
+type ModelTokens struct {
+	Input         int64   `json:"input"`
+	Output        int64   `json:"output"`
+	CacheRead     int64   `json:"cacheRead"`
+	CacheCreation int64   `json:"cacheCreation"`
+	CostUSD       float64 `json:"costUsd"`
+}
+
 // Terminal reports whether the state is final.
 func Terminal(state string) bool {
 	switch state {
@@ -399,10 +415,10 @@ func (s *Store) FinishRun(ctx context.Context, r Run) error {
 		return fmt.Errorf("store: %q is not a terminal state", r.State)
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE runs SET state=?, finished_at=?, exit_code=?, subtype=?, cost_usd=?, num_turns=?, duration_ms=?, reason=?, error=?, model=?,
-		input_tokens=?, output_tokens=?, cache_read_tokens=?, cache_creation_tokens=?, models=?, cpu_ms=?, mem_peak=?
+		input_tokens=?, output_tokens=?, cache_read_tokens=?, cache_creation_tokens=?, models=?, model_usage=?, cpu_ms=?, mem_peak=?
 		WHERE id=? AND state IN (?, ?)`,
 		r.State, ts(r.FinishedAt), r.ExitCode, r.Subtype, r.CostUSD, r.NumTurns, r.DurationMS, r.Reason, r.Error, r.Model,
-		r.InputTokens, r.OutputTokens, r.CacheReadTokens, r.CacheCreationTokens, r.Models, r.CPUMS, r.MemPeak,
+		r.InputTokens, r.OutputTokens, r.CacheReadTokens, r.CacheCreationTokens, r.Models, modelUsageJSON(r.ModelUsage), r.CPUMS, r.MemPeak,
 		r.ID, StateQueued, StateRunning)
 	if err != nil {
 		return err
@@ -419,20 +435,35 @@ func (s *Store) SetRunState(ctx context.Context, id, state string) error {
 	return err
 }
 
-const runCols = `id, task, task_hash, state, trigger, engine, dir, started_at, COALESCE(finished_at,''), exit_code, subtype, model, cost_usd, num_turns, duration_ms, reason, error, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, models, mode,
+const runCols = `id, task, task_hash, state, trigger, engine, dir, started_at, COALESCE(finished_at,''), exit_code, subtype, model, cost_usd, num_turns, duration_ms, reason, error, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, models, model_usage, mode,
 	feeds, feeds_failed, feed_items, feed_new, feed_filtered, fetch_ms,
 	prefilter_ms, prefilter_scored, prefilter_keyword, prefilter_kept, prefilter_dropped, prefilter_cpu_ms, prefilter_mem_peak, prefilter_error, cpu_ms, mem_peak`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
-	var started, finished string
+	var started, finished, usage string
 	err := sc.Scan(&r.ID, &r.Task, &r.TaskHash, &r.State, &r.Trigger, &r.Engine, &r.Dir, &started, &finished, &r.ExitCode, &r.Subtype, &r.Model, &r.CostUSD, &r.NumTurns, &r.DurationMS, &r.Reason, &r.Error,
-		&r.InputTokens, &r.OutputTokens, &r.CacheReadTokens, &r.CacheCreationTokens, &r.Models, &r.Mode,
+		&r.InputTokens, &r.OutputTokens, &r.CacheReadTokens, &r.CacheCreationTokens, &r.Models, &usage, &r.Mode,
 		&r.Feeds, &r.FeedsFailed, &r.FeedItems, &r.FeedNew, &r.FeedFiltered, &r.FetchMS,
 		&r.PrefilterMS, &r.PrefilterScored, &r.PrefilterKeyword, &r.PrefilterKept, &r.PrefilterDropped, &r.PrefilterCPUMS, &r.PrefilterMemPeak, &r.PrefilterError, &r.CPUMS, &r.MemPeak)
 	r.StartedAt = parseTS(started)
 	r.FinishedAt = parseTS(finished)
+	if usage != "" {
+		_ = json.Unmarshal([]byte(usage), &r.ModelUsage)
+	}
 	return r, err
+}
+
+// modelUsageJSON encodes the per-model usage; empty for none.
+func modelUsageJSON(m map[string]ModelTokens) string {
+	if len(m) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // ErrNotFound means no such row.
