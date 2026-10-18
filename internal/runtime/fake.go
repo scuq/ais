@@ -29,6 +29,10 @@ type Fake struct {
 	ExitCode int
 	// RunError, when set, is returned by RunCapture and RunDetached.
 	RunError error
+	// OnRun, when set, answers a RunCapture whose argv it recognizes
+	// (stdout, exit code, true); false falls back to Stdout and ExitCode.
+	// Tests with two container kinds (prefilter and claude) use it.
+	OnRun func(argv []string) (string, int, bool)
 	// BlockUntilCancel makes RunCapture wait for ctx to end, like an engine
 	// client attached to a long-running container.
 	BlockUntilCancel bool
@@ -88,6 +92,12 @@ func (f *Fake) RunCapture(ctx context.Context, argv []string, env []string, stdo
 	f.record("run %s", strings.Join(argv, " "))
 	if f.RunError != nil {
 		return -1, f.RunError
+	}
+	if f.OnRun != nil {
+		if out, code, ok := f.OnRun(argv); ok {
+			_, _ = io.WriteString(stdout, out)
+			return code, nil
+		}
 	}
 	if f.BlockUntilCancel {
 		for i, a := range argv {

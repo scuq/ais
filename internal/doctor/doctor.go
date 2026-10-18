@@ -179,6 +179,27 @@ func Run(ctx context.Context, in Inputs) Report {
 		} else {
 			r.add("ok", "tasks", "%d task(s), %d enabled", len(in.Tasks), enabled)
 		}
+		if in.RT != nil {
+			checked := map[string]bool{}
+			for _, t := range in.Tasks {
+				if t.Feeds == nil || !t.Feeds.Prefilter.Enabled() || checked[t.Feeds.Prefilter.Image] {
+					continue
+				}
+				ref := t.Feeds.Prefilter.Image
+				checked[ref] = true
+				exists, current, err := image.PrefilterIsCurrent(ctx, in.RT, cfg, ref)
+				switch {
+				case err != nil:
+					r.add("fail", "prefilter", "%v", err)
+				case !exists:
+					r.add("warn", "prefilter", "%s is missing (task %s); feed items are kept unscored until 'ais prefilter build'", ref, t.Name)
+				case !current:
+					r.add("warn", "prefilter", "%s was built from another recipe or model; run 'ais prefilter build'", ref)
+				default:
+					r.add("ok", "prefilter", "%s (%s, mode %s, threshold %.2f)", ref, cfg.Image.Prefilter.Model, t.Feeds.Prefilter.Mode, t.Feeds.Prefilter.Threshold)
+				}
+			}
+		}
 	}
 
 	if err := os.MkdirAll(cfg.RunsDir(), 0o700); err != nil {

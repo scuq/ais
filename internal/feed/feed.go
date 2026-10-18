@@ -32,6 +32,13 @@ type Item struct {
 	Source    string    `json:"source"`
 	Summary   string    `json:"summary,omitempty"`
 	Published time.Time `json:"published"`
+	// Score and Match are set by the host's prefilter: the cosine
+	// similarity to the closest inventory entry and that entry's label.
+	// Keep is "keep" or "drop" when the prefilter decided, else empty.
+	Score  float64 `json:"score,omitempty"`
+	Match  string  `json:"match,omitempty"`
+	Keep   string  `json:"keep,omitempty"`
+	Reason string  `json:"reason,omitempty"`
 }
 
 // Result is what one feed returned.

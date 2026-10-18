@@ -274,3 +274,131 @@ func TestFeedItems(t *testing.T) {
 		t.Errorf("prune: %d %v", n, err)
 	}
 }
+
+func TestFeedItemsPrefilter(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	items := []FeedItem{
+		{Key: "a", Title: "PAN-OS flaw", Link: "https://x/a", Summary: "sum a", Published: now.Add(-time.Hour), Decision: DecisionKeep, Reason: "keyword", Match: "PAN-OS"},
+		{Key: "b", Title: "Bakery", Link: "https://x/b", Published: now.Add(-2 * time.Hour), State: FeedFiltered, Decision: DecisionDrop, Reason: "model", Score: 0.1, Scored: true, Model: "m"},
+		{Key: "c", Title: "VPN", Link: "https://x/c", Published: now.Add(-3 * time.Hour), Decision: DecisionKeep, Reason: "model", Score: 0.7, Scored: true, Model: "m"},
+		{Key: "d", Title: "Unscored", Published: now.Add(-4 * time.Hour)},
+	}
+	got, err := s.ClaimFeedItems(ctx, "t", "r1", items, 0, now)
+	if err != nil || len(got) != 3 {
+		t.Fatalf("claim: %+v %v", got, err)
+	}
+	for _, it := range got {
+		if it.Key == "b" {
+			t.Error("a filtered item was handed")
+		}
+		if it.Key == "a" && (it.Summary != "sum a" || it.Decision != DecisionKeep || it.Reason != "keyword" || it.Scored) {
+			t.Errorf("a: %+v", it)
+		}
+		if it.Key == "c" && (!it.Scored || it.Score != 0.7 || it.Model != "m") {
+			t.Errorf("c: %+v", it)
+		}
+		if it.Key == "d" && (it.Decision != "" || it.Scored) {
+			t.Errorf("d: %+v", it)
+		}
+	}
+	states, err := s.FeedItemStates(ctx, "t", []string{"a", "b", "d", "zz"})
+	if err != nil || len(states) != 3 || states["b"].State != FeedFiltered || states["a"].State != FeedHanded || states["d"].Decision != "" {
+		t.Errorf("states: %+v %v", states, err)
+	}
+	// A later tick refreshes the decision columns of a known item and
+	// keeps its state.
+	_ = s.SettleFeedItems(ctx, "r1", true)
+	_, _ = s.ClaimFeedItems(ctx, "t", "", []FeedItem{{Key: "d", Title: "Unscored", Decision: DecisionDrop, Reason: "model", Score: 0.2, Scored: true, State: FeedFiltered}}, 0, now)
+	states, _ = s.FeedItemStates(ctx, "t", []string{"d"})
+	if states["d"].State != FeedSeen || states["d"].Decision != DecisionDrop || states["d"].Score != 0.2 {
+		t.Errorf("refresh: %+v", states["d"])
+	}
+	// A row that waits as new and is dropped now becomes filtered.
+	_, _ = s.ClaimFeedItems(ctx, "t", "", []FeedItem{{Key: "e", Title: "Waiting", Published: now}}, 0, now)
+	_, _ = s.ClaimFeedItems(ctx, "t", "", []FeedItem{{Key: "e", Title: "Waiting", Published: now, Decision: DecisionDrop, Reason: "model", Score: 0.1, Scored: true, State: FeedFiltered}}, 0, now)
+	states, _ = s.FeedItemStates(ctx, "t", []string{"e"})
+	if states["e"].State != FeedFiltered {
+		t.Errorf("waiting row not filtered: %+v", states["e"])
+	}
+	scores, err := s.FeedItemScores(ctx, "t", now.Add(-time.Minute))
+	if err != nil || len(scores) != 5 || scores[0].Key != "c" {
+		t.Errorf("scores: %+v %v", scores, err)
+	}
+	n, err := s.PruneFeedItems(ctx, now.Add(time.Minute))
+	if err != nil || n != 5 {
+		t.Errorf("prune filtered too: %d %v", n, err)
+	}
+}
+
+// TestMigrateAddsFeedItemColumns opens a v0.6.0 database, whose feed_items
+// table has no prefilter columns, and checks that Open adds them.
+func TestMigrateAddsFeedItemColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE feed_items (task TEXT NOT NULL, key TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', link TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '', published TEXT NOT NULL DEFAULT '', first_seen TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new',
+  run_id TEXT NOT NULL DEFAULT '', PRIMARY KEY (task, key));
+  INSERT INTO feed_items (task, key, title, first_seen, state) VALUES ('t', 'old', 'Old', '2026-10-17T09:00:00Z', 'new');`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	got, err := s.ClaimFeedItems(context.Background(), "t", "", nil, 0, time.Now())
+	if err != nil || len(got) != 1 || got[0].Key != "old" || got[0].Scored || got[0].Decision != "" || got[0].Summary != "" {
+		t.Errorf("old row after migration: %+v %v", got, err)
+	}
+	if _, err := Open(path); err != nil {
+		t.Errorf("reopen: %v", err)
+	}
+}
+
+func TestRunUsageColumns(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	quiet := Run{ID: "q", Task: "t", State: StateSkipped, Reason: "quiet", Error: "22 feed(s), 900 item(s), none new", StartedAt: now, FinishedAt: now.Add(time.Second), Mode: "feed",
+		Feeds: 22, FeedsFailed: 1, FeedItems: 900, FeedFiltered: 3, FetchMS: 2500, PrefilterMS: 6000, PrefilterScored: 3, PrefilterKeyword: 1, PrefilterDropped: 3, PrefilterCPUMS: 9000, PrefilterMemPeak: 1 << 30, PrefilterError: "x"}
+	if err := s.InsertRun(ctx, quiet); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetRun(ctx, "q")
+	if err != nil || got.Error != quiet.Error || !got.FinishedAt.Equal(quiet.FinishedAt) || got.Feeds != 22 || got.FeedsFailed != 1 || got.FeedItems != 900 || got.FeedFiltered != 3 || got.FetchMS != 2500 ||
+		got.PrefilterMS != 6000 || got.PrefilterScored != 3 || got.PrefilterKeyword != 1 || got.PrefilterDropped != 3 || got.PrefilterCPUMS != 9000 || got.PrefilterMemPeak != 1<<30 || got.PrefilterError != "x" {
+		t.Errorf("quiet row: %+v %v", got, err)
+	}
+	run := Run{ID: "m", Task: "u", State: StateRunning, StartedAt: now.Add(time.Minute), Mode: "feed", FeedNew: 2}
+	_ = s.InsertRun(ctx, run)
+	if r, _ := s.GetRun(ctx, "m"); !r.FinishedAt.IsZero() {
+		t.Errorf("a running row has a finish time: %v", r.FinishedAt)
+	}
+	run.State, run.FinishedAt, run.CPUMS, run.MemPeak = StateSucceeded, now.Add(2*time.Minute), 3100, 300<<20
+	if err := s.FinishRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := s.GetRun(ctx, "m"); r.CPUMS != 3100 || r.MemPeak != 300<<20 || r.FeedNew != 2 {
+		t.Errorf("finished row: %+v", r)
+	}
+	all, err := s.RunsSince(ctx, "", now.Add(-time.Hour))
+	if err != nil || len(all) != 2 || all[0].ID != "q" {
+		t.Errorf("all tasks: %+v %v", all, err)
+	}
+	one, _ := s.RunsSince(ctx, "u", now.Add(-time.Hour))
+	if len(one) != 1 || one[0].ID != "m" {
+		t.Errorf("one task: %+v", one)
+	}
+	_ = s.SaveResult(ctx, "m", "u", now.Add(2*time.Minute), []byte(`{"findings":[]}`), nil)
+	res, err := s.ResultsSince(ctx, "", now)
+	if err != nil || len(res) != 1 || res[0].ClearJSON != nil || string(res[0].PseudoJSON) != `{"findings":[]}` {
+		t.Errorf("results: %+v %v", res, err)
+	}
+}

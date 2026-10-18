@@ -3,6 +3,39 @@
 All notable changes to this project are in this file.
 The format follows Keep a Changelog.
 
+## [0.7.0] - 2026-10-18
+
+### Added
+
+- The task key `feeds.prefilter` with `mode` (`off`, `shadow`, or `enforce`, default `off`), `threshold` (default `0.45`), `image` (default `localhost/ais-prefilter:latest`), `timeout` (default `120s`), `keywords` (default `true`), and `maxTokens` (default `128`). Before a feed run, the host scores each new item against the inventory. A vendor or product name in the item always keeps it. A one-shot container without a network scores the other items with a local embedding model. If the score is at least `threshold`, ais keeps the item. If scoring fails, ais keeps every item without a decision and logs the error.
+- In `shadow` mode, ais records the scores and still hands every item to the model. In `enforce` mode, ais records an item below `threshold` as `filtered` and never hands it to the model. A feed check where every item is filtered is a quiet run, and the column `error` of the run shows `N filtered by the prefilter`.
+- The config key `image.prefilter` with `model` (default `cisco-ai/SecureBERT2.0-biencoder`), `revision` (default `main`), and `quantize` (`int8` or `none`, default `int8`). It sets how `ais prefilter build` builds the image.
+- The command `ais prefilter build [--no-cache] [--tag REF] [--model-dir DIR]` builds the prefilter image from the recipe in the binary. The first build downloads torch and the model, takes several minutes, and needs a few gigabytes of temporary disk. `--model-dir` takes a model that you exported with `assets/prefilter/export.py`.
+- The command `ais prefilter test [--rescore] [--keep] <task>` scores the current new items and prints `SCORE`, `DECISION`, `WHY` (the keyword that matched, `model`, or `error`), `MATCH`, `SOURCE`, and `TITLE`. It claims no item, but it records the decisions.
+- The command `ais prefilter stats [--since D] [--json] <task>` compares the recorded scores with the items that the model reported or checked. It prints a histogram, the lowest score of a reported item, and a verdict on the threshold.
+- The command `ais prefilter set <task> key=value...` changes `feeds.prefilter` in the task file. It checks the new file and keeps a backup.
+- The table `feed_items` gains the columns `summary`, `score`, `match`, `decision` (`keep` or `drop`), `reason` (`keyword`, `model`, or `error`), and `model`, and the new state `filtered`. ais adds the columns to an existing database at start. The retention job deletes `filtered` items as it deletes `seen` items.
+- `ais run --dry-run <task>` scores the items of a task with a prefilter. It prints the decision of each item and the items that the prefilter withholds from the model.
+- `ais doctor` checks the prefilter image of each task that has a prefilter.
+- The daemon logs a warning at start if the prefilter image of a task is missing or stale. The daemon never builds the image.
+- The command `aisctl report [--task T] [--windows 24h,7d,30d] [--runs] [--json]` prints what ais ran and what it cost. It has one column for each window. The suffix `d` means days. The sections are `TICKS`, `FEEDS`, `PREFILTER`, `MODEL`, `RESULTS`, and `TOTAL`. The last line shows the CPU time and memory of the ais daemon since its start. `--runs` lists every run of the first window. `--json` prints `{report, daemon}`.
+- The table `runs` gains the columns `feeds`, `feeds_failed`, `feed_items`, `feed_new`, `feed_filtered`, `fetch_ms`, `prefilter_ms`, `prefilter_scored`, `prefilter_keyword`, `prefilter_kept`, `prefilter_dropped`, `prefilter_cpu_ms`, `prefilter_mem_peak`, `prefilter_error`, `cpu_ms`, and `mem_peak`. ais adds the columns to an existing database at start. Older rows have no figures. Tokens and cost go back to the first run.
+- Every feed tick, also a `quiet` or `ratelimit` row, records the feed and prefilter columns. A model run records `cpu_ms` and `mem_peak` at its end.
+- The run container writes `out/usage.json` with `cpu_usec`, `user_usec`, `system_usec`, and `mem_peak`. The values come from the cgroup v2 counters of the container.
+- The output of the prefilter container has the field `usage` with `cpu_usec`, `mem_peak`, and `source`. If the container cannot read the cgroup counters, `source` is `rusage`.
+- Rebuild both images to get the new figures: run `ais image build` and `ais prefilter build`. The daemon builds the run image by itself. `ais prefilter build --model-dir DIR` reuses an exported model.
+
+### Changed
+
+- The template `vuln-watch` reads three more feeds: BleepingComputer, Zero Day Initiative (published advisories), and SANS Internet Storm Center. It now has 25 feed URLs.
+- The entrypoint of the run container starts `claude` as a child process and no longer replaces itself with it. It forwards `TERM`, `INT`, and `HUP` to `claude`, waits for it, writes `out/usage.json`, and exits with the exit code of `claude`.
+- The prompt of a feed run marks an item that the prefilter kept with `[matches <vendor product version>]`. A dropped item in `shadow` mode goes to the model without a mark.
+- The template `vuln-watch` has the block `feeds.prefilter` with the mode `shadow` and the threshold `0.45`. The prompt has a sentence about the `[matches ...]` mark. Run `ais prefilter build` to build the image. Without the image, ais keeps every item. To get this in an existing task, add the block and the prompt sentence, or run `ais templates use vuln-watch --force`. A task without `feeds.prefilter` works as before.
+
+### Fixed
+
+- A skipped run (`quiet`, `ratelimit`, `overlap`, or `config`) now stores its `error` text and its finish time. Before, `InsertRun` left both columns empty.
+
 ## [0.6.0] - 2026-10-18
 
 ### Added

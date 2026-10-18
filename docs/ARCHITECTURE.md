@@ -28,9 +28,12 @@ The entrypoint of the container (`assets/entrypoint.sh`) does these steps:
 1. It exits with code 78 if `CLAUDE_CODE_OAUTH_TOKEN` is not set, if `ANTHROPIC_API_KEY` is set, or if `argv.json`, `prompt.md`, or `settings.json` is missing from `in/`.
 2. It copies `settings.json` to the configuration directory in tmpfs and writes a `.claude.json` that marks the onboarding as done.
 3. It reads `argv.json` with `jq`, one element for each line.
-4. It runs `claude` with the argument list and gives `prompt.md` on standard input.
+4. It starts `claude` as a child process with the argument list and gives `prompt.md` on standard input.
+5. It forwards `TERM`, `INT`, and `HUP` to `claude` and waits until `claude` exits.
+6. It reads `usage_usec`, `user_usec`, and `system_usec` from `cpu.stat` and the peak from `memory.peak`, both in the cgroup v2 directory of the container. A missing counter is 0.
+7. It writes `out/usage.json` and exits with the exit code of `claude`. If the write fails, it ignores the error.
 
-`tini` is the init process (PID 1) of the container. A stop signal reaches `claude`, and `tini` collects zombie processes.
+`tini` is the init process (PID 1) of the container. A stop signal reaches the entrypoint, which passes it on to `claude`. `tini` collects zombie processes.
 
 ### Claude Code arguments
 
@@ -94,13 +97,14 @@ The capture in `stdout.json` still gets every line. `ParseEnvelope` finds the re
 | `cmd/ais` | The program entry point. It calls `app.Main`. |
 | `assets` | Embedded files: Containerfile, entrypoint, squid template, allowlists, examples, systemd unit. |
 | `cmd/aisctl`, `internal/aisctl` | The installer and lifecycle tool `aisctl`. `cmd/ais` and `cmd/aisctl` build the same program. Each entry point checks `filepath.Base(os.Args[0])` and starts `aisctl.Main` or `app.Main`. `inventory.go` holds the `aisctl inventory` subcommands. They pseudonymize with `pseudo.Redactor`, keep the map in `inventory.redact-map.json` in the state directory, and back up the file before each write. |
-| `internal/app` | The command line. It parses arguments and calls the other packages. It also holds the daemon loop, the retention loop, and the digest loop (`digestLoop`). |
+| `internal/app` | The command line. It parses arguments and calls the other packages. It also holds the daemon loop, the retention loop, and the digest loop (`digestLoop`). `prefilter.go` holds the commands `ais prefilter build`, `test`, `stats`, and `set`. |
 | `internal/config` | Defaults, YAML file, environment variables, and validation of the configuration. |
 | `internal/task` | The task schema, defaults, validation, and loading from a directory. |
 | `internal/inventory` | Reads CSV, JSON, YAML, and `mdj` inventories, and the free-text inventory. Builds the minimized groups and gathers the collected values. `Document` is the parsed `mdj` structure: entries with a title, ordered JSON values, and sections. `mdj.go` parses it and writes it again (round trip). `panorama.go` reads a Panorama CSV export and merges it into a `Document`. The grouping adds the reserved field `count` (`CountField`). The records view has the field `title`. |
 | `internal/templates` | The task templates in the binary: list, show, and install. |
 | `internal/pseudo` | Field policy, tokens, token map, depseudonymization, redactor, and leak check. |
 | `internal/feed` | Fetches RSS 2.0, Atom, RDF, and CISA KEV JSON feeds on the host (`FetchAll`, at most four at a time). It reduces each entry to an `Item` with a `Key`: a hash of the GUID, else the link, else the title. A failed feed has `Err` set and no items. |
+| `internal/prefilter` | Scores new feed items against the inventory before a run. `Score` runs the lexical pass and then the scoring container, and never returns an error. `BuildTargets` turns the minimized groups and the free-text lines into targets. `Lexical` matches the keywords. `Spec` is the container specification. |
 | `internal/prompt` | Renders the prompt and the other input files. |
 | `internal/claude` | The Claude Code argument list, the result envelope, and output validation. |
 | `internal/container` | The container specification and its translation to an engine command line. It has the docker and podman dialects. |
@@ -112,7 +116,8 @@ The capture in `stdout.json` still gets every line. `ParseEnvelope` finds the re
 | `internal/store` | The SQLite database. |
 | `internal/sink` | The webhook, NATS, Splunk, and Webex sinks, and the dispatcher. `digest.go` builds the digest event and queues the digest delivery (`QueueDigest`). |
 | `internal/secret` | The encrypted secret store, the passphrase, and the `${secret:NAME}` expansion. |
-| `internal/image` | The image recipe hash, the build, and the check of the Claude Code flags. |
+| `internal/image` | The image recipe hash, the build, and the check of the Claude Code flags. `prefilter.go` does the same for the prefilter image: recipe hash, build context, build arguments, and `PrefilterIsCurrent`. |
+| `internal/report` | Sums the rows of `runs` and the results into windows (`Build`), and prints them as text (`Render`). `aisctl report` calls it. It reads the figures only from the database. |
 | `internal/doctor` | The checks of `ais doctor`. |
 | `internal/output` | Output to the terminal. Status goes to standard error. Data goes to standard output. |
 
@@ -178,7 +183,7 @@ The image sets the same `DISABLE_*` values as defaults. This protects a person w
 
 ### Ownership labels
 
-ais puts these labels on every container, network, and image that it creates: `io.ais.managed`, `io.ais.schema`, and `io.ais.role`. The role is `run`, `proxy`, `backend`, or `network`. A run container also has `io.ais.task` and `io.ais.run`. The image has `io.ais.recipe` and `io.ais.version`.
+ais puts these labels on every container, network, and image that it creates: `io.ais.managed`, `io.ais.schema`, and `io.ais.role`. The role is `run`, `proxy`, `backend`, `network`, or `prefilter`. A run container also has `io.ais.task` and `io.ais.run`. The image has `io.ais.recipe` and `io.ais.version`.
 
 ## Network topology
 
@@ -326,14 +331,14 @@ The database is one SQLite file in WAL mode, `ais.db`, with mode 0600. The conne
 
 | Table | Content |
 |---|---|
-| `runs` | One row for each run: state, reason, cost, turns, duration, and the mode (`feed` or `full`; empty for rows from before feed checks). The cap `feeds.maxRunsPerDay` counts the rows with the mode `feed`, the trigger `schedule`, and a state other than `skipped`. |
+| `runs` | One row for each run: state, reason, cost, turns, duration, mode, and the usage columns (see Usage report). The mode is `feed` or `full`, and empty for rows from before feed checks. The cap `feeds.maxRunsPerDay` counts the rows with the mode `feed`, the trigger `schedule`, and a state other than `skipped`. |
 | `task_salts` | The salt of each task. |
 | `pseudonyms` | The token map of each task. |
 | `results` | The pseudonymized result and the clear result of each run. |
 | `leaks` | The values and the context of a leak. |
 | `prompts` | The system prompt, the prompt, and the arguments of each run. The retention rule removes a row with its run. |
 | `run_tokens` | Hashes of the bearer tokens, with expiry and revocation. |
-| `feed_items` | The feed items of each task, with the state `new`, `handed`, or `seen`, and the `run_id` that got them. The primary key is `task` and `key`. See Feed checks. |
+| `feed_items` | The feed items of each task, with the state `new`, `handed`, `seen`, or `filtered`, and the `run_id` that got them. The primary key is `task` and `key`. The columns `summary`, `score`, `match`, `decision`, `reason`, and `model` hold the item summary and the outcome of the prefilter. `migrate` adds them to an existing database. See Feed checks. |
 | `deliveries` | The delivery queue. The column `payload` holds the window of a `digest` row. `migrate` adds it to an existing database. |
 
 CAUTION: The database holds real values: the token map, the clear results, and the leaked values. Protect the state directory like the inventory.
@@ -464,9 +469,96 @@ In `feed` mode, `Prepare` calls `readFeeds` before it creates the prompt:
 If no item is new and `feeds.skipWhenQuiet` is true, `Prepare` removes the run directory and returns `ErrQuiet`. The runner then inserts a run in the state `skipped` with the reason `quiet`. The column `error` holds the counts from `feedSummary`. The runner starts no container.
 
 After the run, `Store.SettleFeedItems` sets the `handed` items of the run to `seen` if the run succeeded. In any other case it sets them to `new`, so the next feed run gets them again.
-`Store.PruneFeedItems` deletes `seen` items first seen before the cutoff. The retention job in `internal/app` calls it with the same cutoff as `retention.keepDays`. It does not run if `retention.keepDays` is 0.
+`Store.PruneFeedItems` deletes `seen` and `filtered` items first seen before the cutoff. The retention job in `internal/app` calls it with the same cutoff as `retention.keepDays`. It does not run if `retention.keepDays` is 0.
 
-A dry run sets `Options.Peek`. `ClaimFeedItems` then gets an empty run ID and claims nothing. `ais feeds test` uses the same call. `BuildDigest` counts a `skipped` run with the reason `quiet` as `Quiet` and not as `Skipped`.
+### Prefilter
+
+If the task has `feeds.prefilter` with the mode `shadow` or `enforce`, `Prepare` scores the new items inside `readFeeds`. The call comes after `FetchAll` and the removal of duplicates, and before `ClaimFeedItems`. `Prepare` calls `readFeeds` after it applies the field policy to the inventory. `prefilter.BuildTargets` builds the targets from the same groups and free-text lines that the prompt shows.
+
+`scoreFeedItems` does these steps:
+
+1. Ask `Store.FeedItemStates` for the stored rows of the item keys.
+2. Select the items to score. An item is scored if it has no row, or if its row has the state `new` and no decision. `Options.Rescore` also selects a `new` item with a decision.
+3. Call `prefilter.Score` with the work directory `<run dir>/prefilter`.
+4. Write the decision, score, match, reason, and model into the items. In `enforce` mode, ais sets the state of a dropped item to `filtered`.
+
+`Store.ClaimFeedItems` writes the columns of an item that has a decision, also when the row exists. It sets the state `filtered` only when it inserts the row. It does not change the state of an existing row. It selects only items in the state `new`, so no run gets a `filtered` item.
+
+`prefilter.Score` does these steps:
+
+1. Lexical pass. Unless `feeds.prefilter.keywords` is `false`, `Lexical` tests each item. The keywords of a group are the vendor and product names. The keywords of a free-text line are its words that start with an uppercase letter. A keyword matches a whole token or a contiguous token sequence in the lowercase text. Generic words such as `networks` and `systems` are not keywords. A hit keeps the item with the reason `keyword`.
+2. Embedding pass. The items without a hit go to the scoring container. The score of an item is the cosine similarity to its closest target. `score >= threshold` keeps the item. The reason is `model`.
+3. Error. If the pass cannot decide, `Score` keeps every undecided item with the reason `error` and puts the cause in `Info.Err`. The causes are:
+
+   - No targets or no runtime.
+   - A nonzero exit code or a timeout.
+   - Output that is not JSON, or a wrong protocol version.
+   - A missing score for an item.
+
+The `Decision` of an item is `keep` or `drop`. The store records `drop` for a dropped item in both `shadow` and `enforce` mode. Only `enforce` changes the state to `filtered`.
+In `shadow` mode, a dropped item stays `new` and goes to the model. `readFeeds` sets `Match` only for a `keep` item, so the prompt marks only kept items.
+If every item is `filtered`, `.Feed` is empty and `Prepare` returns `ErrQuiet`. The runner writes `N filtered by the prefilter` into the column `error`, through `feedSummary`. It starts no Claude Code container.
+
+The scoring container comes from `prefilter.Spec`:
+
+- The image is `feeds.prefilter.image`. The container runs once and `--rm` removes it.
+- The root filesystem is read-only. All capabilities are dropped. `no-new-privileges` is set. The memory limit is 2g and the process limit is 64.
+- `--network none` gives the container no interface. This is the field `Spec.NoNetwork`.
+- A tmpfs of 64m is mounted on `/tmp`. The directory `prefilter` of the run is mounted read-only on `/work`.
+- The label `io.ais.role` is `prefilter`.
+- The container has the uid and gid of the run container.
+
+The protocol is version 1. The container reads `/work/in.json`:
+
+    {"v": 1, "max_tokens": 128,
+     "targets": [{"id": "g0", "text": "..."}],
+     "items": [{"key": "...", "text": "..."}]}
+
+It prints one JSON document on standard output:
+
+    {"v": 1, "model": "...", "dim": 768, "ms": 1234,
+     "scores": [{"key": "...", "score": 0.71, "best": "g0"}],
+     "usage": {"cpu_usec": 800000, "mem_peak": 806000000, "source": "cgroup"}}
+
+The field `usage` is the CPU time and the peak memory of the container. `source` is `cgroup`, or `rusage` if the script cannot read the cgroup files. `Info.CPU` and `Info.MemPeak` hold the values.
+`Score` saves the standard output as `out.json` and the standard error as `err.log` in the work directory. The text of an item is its title, then a period and the summary. `feeds.prefilter.timeout` limits the container through the context.
+`assets/prefilter/prefilter.py` embeds the texts, pools them as `model.json` says (`mean` or `cls`), and scales each vector to length 1. The score is then the dot product.
+
+The states of a feed item are:
+
+| State | Meaning |
+|---|---|
+| `new` | No run has the item. A `shadow` item that the prefilter would drop is also `new` until a run gets it. |
+| `handed` | A run has the item. |
+| `seen` | A run with the item succeeded. |
+| `filtered` | The prefilter dropped the item in `enforce` mode. |
+
+`Store.FeedItemScores` returns the decided items since a time, best score first. `ais prefilter stats` joins them with the results of the task by URL. It reads `findings[].source_urls` as reported and `checked[].url` as checked. The lowest score of a reported item is the evidence for the threshold.
+
+The daemon calls `warnPrefilterImages` at start. It logs a warning for each missing or stale prefilter image. It never builds the image. `ais doctor` makes the same check with the result `ok`, `warn`, or `fail`.
+
+A dry run sets `Options.Peek`. `ClaimFeedItems` then gets an empty run ID and claims nothing. `ais feeds test` uses the same call. A dry run still starts the scoring container and records the decisions. `ais prefilter test` sets `Peek` too. `BuildDigest` counts a `skipped` run with the reason `quiet` as `Quiet` and not as `Skipped`.
+
+## Usage report
+
+`aisctl report` calls `Store.RunsSince` and `Store.ResultsSince` for the longest window, one task or all tasks. `report.Build` fills each window from them. `report.Render` prints the text.
+
+The runner records the figures in the table `runs`:
+
+| Columns | Source |
+|---|---|
+| `feeds`, `feeds_failed`, `feed_items`, `feed_new`, `feed_filtered`, `fetch_ms` | The feed fetch on the host. |
+| `prefilter_ms`, `prefilter_scored`, `prefilter_keyword`, `prefilter_kept`, `prefilter_dropped`, `prefilter_error` | The result of `prefilter.Score`. |
+| `prefilter_cpu_ms`, `prefilter_mem_peak` | The field `usage` of the prefilter output. |
+| `cpu_ms`, `mem_peak` | `out/usage.json`, which `readUsage` in `internal/runner/run.go` reads at the end of a model run. |
+
+`Prepared.UsageColumns` in `internal/runner/prepare.go` gives the feed and prefilter columns. The runner records them for every feed tick, also for `quiet` and `ratelimit` rows. `migrate` adds the columns to an existing database. Older rows have no figures. A model run counts in the CPU rows only if it reported CPU time or memory.
+
+Both containers read their own cgroup v2 counters. Docker and podman give each container a private cgroup namespace, so the files in `/sys/fs/cgroup` belong to the container.
+
+A skipped run (`quiet`, `ratelimit`, `overlap`, or `config`) stores its `error` text and its finish time. `ais prefilter stats` reads its window with `Store.ResultsSince`, because `RecentResults` caps its limit.
+
+`aisctl report` also runs `systemctl --user show ais.service` for the CPU time and the memory of the daemon. The containers are not part of those values.
 
 ## Image
 
@@ -477,6 +569,19 @@ The apt options `Acquire::Check-Date=false` are explained in `README.md`.
 
 After the build, `CheckFlags` runs `claude --help` in the image. It looks for 15 flags in the output. If one is missing, the build fails with a message that asks for another `image.claudeVersion`. The CLI accepts unknown flags without an error, so the help text is the only signal of a change.
 Two flags that ais uses, `--max-turns` and `--append-system-prompt-file`, are not in the help text and are not checked.
+
+### Prefilter image
+
+`ais prefilter build` writes the files of `assets/prefilter` to a temporary build context: `Containerfile`, `prefilter.py`, `export.py`, and `selftest.json`. It runs `<engine> build` with the build arguments `SOURCE`, `MODEL`, `MODEL_REVISION`, and `QUANTIZE`. The default tag is `localhost/ais-prefilter:latest`.
+The recipe hash covers the four files and the keys `image.prefilter.model`, `image.prefilter.revision`, and `image.prefilter.quantize`. The image has it in the label `io.ais.recipe`. The image is stale if the label differs.
+
+The Containerfile has these stages:
+
+1. `export-hf` starts from `python:3.12-slim`. It installs torch from the CPU index and `optimum`. `export.py` exports the model to ONNX. It checks the ONNX pipeline against sentence-transformers. If `QUANTIZE` is `int8`, it tries several 8-bit weight quantizations, most precise first, and keeps the first one whose embeddings stay within a cosine of 0.95 of the fp32 embeddings on the self-test texts. If none does, it ships the fp32 model.
+2. `export-dir` takes the directory `model/` of the context. `ais prefilter build --model-dir` fills it.
+3. The run image starts from `python:3.12-slim` and installs `onnxruntime`, `tokenizers`, and `numpy`. It copies the model from the chosen stage. The user is 1000:1000.
+
+`SOURCE` selects the stage: `hf` or `dir`. During the build, `prefilter.py --selftest` runs. The build fails if a related pair does not score above an unrelated text. The first build with `hf` downloads torch and the model and needs a few gigabytes of temporary disk.
 
 ## See also
 

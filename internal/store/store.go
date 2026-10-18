@@ -75,7 +75,24 @@ CREATE TABLE IF NOT EXISTS runs (
   cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
   models TEXT NOT NULL DEFAULT '',
   reason TEXT NOT NULL DEFAULT '',
-  error TEXT NOT NULL DEFAULT ''
+  error TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL DEFAULT '',
+  feeds INTEGER NOT NULL DEFAULT 0,
+  feeds_failed INTEGER NOT NULL DEFAULT 0,
+  feed_items INTEGER NOT NULL DEFAULT 0,
+  feed_new INTEGER NOT NULL DEFAULT 0,
+  feed_filtered INTEGER NOT NULL DEFAULT 0,
+  fetch_ms INTEGER NOT NULL DEFAULT 0,
+  prefilter_ms INTEGER NOT NULL DEFAULT 0,
+  prefilter_scored INTEGER NOT NULL DEFAULT 0,
+  prefilter_keyword INTEGER NOT NULL DEFAULT 0,
+  prefilter_kept INTEGER NOT NULL DEFAULT 0,
+  prefilter_dropped INTEGER NOT NULL DEFAULT 0,
+  prefilter_cpu_ms INTEGER NOT NULL DEFAULT 0,
+  prefilter_mem_peak INTEGER NOT NULL DEFAULT 0,
+  prefilter_error TEXT NOT NULL DEFAULT '',
+  cpu_ms INTEGER NOT NULL DEFAULT 0,
+  mem_peak INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS runs_task_started ON runs(task, started_at DESC);
 CREATE INDEX IF NOT EXISTS runs_state ON runs(state);
@@ -145,6 +162,12 @@ CREATE TABLE IF NOT EXISTS feed_items (
   first_seen TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'new',
   run_id TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  score REAL,
+  match TEXT NOT NULL DEFAULT '',
+  decision TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (task, key)
 );
 CREATE INDEX IF NOT EXISTS feed_items_state ON feed_items(task, state);
@@ -173,12 +196,41 @@ var runColumnsAdded = []struct{ name, def string }{
 	{"cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"},
 	{"models", "TEXT NOT NULL DEFAULT ''"},
 	{"mode", "TEXT NOT NULL DEFAULT ''"},
+	// What a feed tick fetched and what the prefilter and the containers
+	// used; see Run.
+	{"feeds", "INTEGER NOT NULL DEFAULT 0"},
+	{"feeds_failed", "INTEGER NOT NULL DEFAULT 0"},
+	{"feed_items", "INTEGER NOT NULL DEFAULT 0"},
+	{"feed_new", "INTEGER NOT NULL DEFAULT 0"},
+	{"feed_filtered", "INTEGER NOT NULL DEFAULT 0"},
+	{"fetch_ms", "INTEGER NOT NULL DEFAULT 0"},
+	{"prefilter_ms", "INTEGER NOT NULL DEFAULT 0"},
+	{"prefilter_scored", "INTEGER NOT NULL DEFAULT 0"},
+	{"prefilter_keyword", "INTEGER NOT NULL DEFAULT 0"},
+	{"prefilter_kept", "INTEGER NOT NULL DEFAULT 0"},
+	{"prefilter_dropped", "INTEGER NOT NULL DEFAULT 0"},
+	{"prefilter_cpu_ms", "INTEGER NOT NULL DEFAULT 0"},
+	{"prefilter_mem_peak", "INTEGER NOT NULL DEFAULT 0"},
+	{"prefilter_error", "TEXT NOT NULL DEFAULT ''"},
+	{"cpu_ms", "INTEGER NOT NULL DEFAULT 0"},
+	{"mem_peak", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 // deliveryColumnsAdded lists the columns added to deliveries after the
 // first release. payload carries the window of a digest delivery.
 var deliveryColumnsAdded = []struct{ name, def string }{
 	{"payload", "TEXT NOT NULL DEFAULT ''"},
+}
+
+// feedItemColumnsAdded lists the columns that migrate adds to an existing
+// feed_items table: the summary and what the prefilter decided.
+var feedItemColumnsAdded = []struct{ name, def string }{
+	{"summary", "TEXT NOT NULL DEFAULT ''"},
+	{"score", "REAL"},
+	{"match", "TEXT NOT NULL DEFAULT ''"},
+	{"decision", "TEXT NOT NULL DEFAULT ''"},
+	{"reason", "TEXT NOT NULL DEFAULT ''"},
+	{"model", "TEXT NOT NULL DEFAULT ''"},
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -188,7 +240,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	for _, m := range []struct {
 		table string
 		cols  []struct{ name, def string }
-	}{{"runs", runColumnsAdded}, {"deliveries", deliveryColumnsAdded}} {
+	}{{"runs", runColumnsAdded}, {"deliveries", deliveryColumnsAdded}, {"feed_items", feedItemColumnsAdded}} {
 		have, err := s.columns(ctx, m.table)
 		if err != nil {
 			return err
@@ -229,6 +281,14 @@ func (s *Store) columns(ctx context.Context, table string) (map[string]bool, err
 const tsLayout = time.RFC3339Nano
 
 func ts(t time.Time) string { return t.UTC().Format(tsLayout) }
+
+// nullTS is ts for a column that stays NULL until it is set.
+func nullTS(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return ts(t)
+}
 
 func parseTS(s string) time.Time {
 	if s == "" {
@@ -284,6 +344,32 @@ type Run struct {
 	// Mode is "feed" for a feed check and "full" for the complete check;
 	// empty for rows from before feed checks existed.
 	Mode string `json:"mode,omitempty"`
+
+	// Feed tick: feeds read, feeds that failed, distinct items fetched,
+	// items handed to the model, items the prefilter withheld, and the
+	// wall time of the fetch.
+	Feeds        int   `json:"feeds,omitempty"`
+	FeedsFailed  int   `json:"feedsFailed,omitempty"`
+	FeedItems    int   `json:"feedItems,omitempty"`
+	FeedNew      int   `json:"feedNew,omitempty"`
+	FeedFiltered int   `json:"feedFiltered,omitempty"`
+	FetchMS      int64 `json:"fetchMs,omitempty"`
+	// Prefilter: wall time, items scored by the model, keyword hits,
+	// kept and dropped items, CPU time and peak memory of its container,
+	// and why the model pass did not decide (empty when it did).
+	PrefilterMS      int64  `json:"prefilterMs,omitempty"`
+	PrefilterScored  int    `json:"prefilterScored,omitempty"`
+	PrefilterKeyword int    `json:"prefilterKeyword,omitempty"`
+	PrefilterKept    int    `json:"prefilterKept,omitempty"`
+	PrefilterDropped int    `json:"prefilterDropped,omitempty"`
+	PrefilterCPUMS   int64  `json:"prefilterCpuMs,omitempty"`
+	PrefilterMemPeak int64  `json:"prefilterMemPeak,omitempty"`
+	PrefilterError   string `json:"prefilterError,omitempty"`
+	// CPUMS and MemPeak are the CPU time and the peak memory (bytes) of
+	// the model container, as its cgroup reported them; zero when not
+	// measured.
+	CPUMS   int64 `json:"cpuMs,omitempty"`
+	MemPeak int64 `json:"memPeak,omitempty"`
 }
 
 // Terminal reports whether the state is final.
@@ -297,9 +383,13 @@ func Terminal(state string) bool {
 
 // InsertRun records a new run.
 func (s *Store) InsertRun(ctx context.Context, r Run) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO runs (id, task, task_hash, state, trigger, engine, dir, started_at, model, reason, mode)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.Task, r.TaskHash, r.State, r.Trigger, r.Engine, r.Dir, ts(r.StartedAt), r.Model, r.Reason, r.Mode)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO runs (id, task, task_hash, state, trigger, engine, dir, started_at, finished_at, model, reason, error, mode,
+		feeds, feeds_failed, feed_items, feed_new, feed_filtered, fetch_ms,
+		prefilter_ms, prefilter_scored, prefilter_keyword, prefilter_kept, prefilter_dropped, prefilter_cpu_ms, prefilter_mem_peak, prefilter_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.Task, r.TaskHash, r.State, r.Trigger, r.Engine, r.Dir, ts(r.StartedAt), nullTS(r.FinishedAt), r.Model, r.Reason, r.Error, r.Mode,
+		r.Feeds, r.FeedsFailed, r.FeedItems, r.FeedNew, r.FeedFiltered, r.FetchMS,
+		r.PrefilterMS, r.PrefilterScored, r.PrefilterKeyword, r.PrefilterKept, r.PrefilterDropped, r.PrefilterCPUMS, r.PrefilterMemPeak, r.PrefilterError)
 	return err
 }
 
@@ -309,10 +399,10 @@ func (s *Store) FinishRun(ctx context.Context, r Run) error {
 		return fmt.Errorf("store: %q is not a terminal state", r.State)
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE runs SET state=?, finished_at=?, exit_code=?, subtype=?, cost_usd=?, num_turns=?, duration_ms=?, reason=?, error=?, model=?,
-		input_tokens=?, output_tokens=?, cache_read_tokens=?, cache_creation_tokens=?, models=?
+		input_tokens=?, output_tokens=?, cache_read_tokens=?, cache_creation_tokens=?, models=?, cpu_ms=?, mem_peak=?
 		WHERE id=? AND state IN (?, ?)`,
 		r.State, ts(r.FinishedAt), r.ExitCode, r.Subtype, r.CostUSD, r.NumTurns, r.DurationMS, r.Reason, r.Error, r.Model,
-		r.InputTokens, r.OutputTokens, r.CacheReadTokens, r.CacheCreationTokens, r.Models,
+		r.InputTokens, r.OutputTokens, r.CacheReadTokens, r.CacheCreationTokens, r.Models, r.CPUMS, r.MemPeak,
 		r.ID, StateQueued, StateRunning)
 	if err != nil {
 		return err
@@ -329,13 +419,17 @@ func (s *Store) SetRunState(ctx context.Context, id, state string) error {
 	return err
 }
 
-const runCols = `id, task, task_hash, state, trigger, engine, dir, started_at, COALESCE(finished_at,''), exit_code, subtype, model, cost_usd, num_turns, duration_ms, reason, error, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, models, mode`
+const runCols = `id, task, task_hash, state, trigger, engine, dir, started_at, COALESCE(finished_at,''), exit_code, subtype, model, cost_usd, num_turns, duration_ms, reason, error, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, models, mode,
+	feeds, feeds_failed, feed_items, feed_new, feed_filtered, fetch_ms,
+	prefilter_ms, prefilter_scored, prefilter_keyword, prefilter_kept, prefilter_dropped, prefilter_cpu_ms, prefilter_mem_peak, prefilter_error, cpu_ms, mem_peak`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
 	var started, finished string
 	err := sc.Scan(&r.ID, &r.Task, &r.TaskHash, &r.State, &r.Trigger, &r.Engine, &r.Dir, &started, &finished, &r.ExitCode, &r.Subtype, &r.Model, &r.CostUSD, &r.NumTurns, &r.DurationMS, &r.Reason, &r.Error,
-		&r.InputTokens, &r.OutputTokens, &r.CacheReadTokens, &r.CacheCreationTokens, &r.Models, &r.Mode)
+		&r.InputTokens, &r.OutputTokens, &r.CacheReadTokens, &r.CacheCreationTokens, &r.Models, &r.Mode,
+		&r.Feeds, &r.FeedsFailed, &r.FeedItems, &r.FeedNew, &r.FeedFiltered, &r.FetchMS,
+		&r.PrefilterMS, &r.PrefilterScored, &r.PrefilterKeyword, &r.PrefilterKept, &r.PrefilterDropped, &r.PrefilterCPUMS, &r.PrefilterMemPeak, &r.PrefilterError, &r.CPUMS, &r.MemPeak)
 	r.StartedAt = parseTS(started)
 	r.FinishedAt = parseTS(finished)
 	return r, err
@@ -390,6 +484,51 @@ func (s *Store) RunsBetween(ctx context.Context, task string, start, end time.Ti
 		r, err := scanRun(rows)
 		if err != nil {
 			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RunsSince returns the runs that started at or after since, oldest
+// first, of one task or, with an empty task, of every task. Runs that are
+// still queued or running are included.
+func (s *Store) RunsSince(ctx context.Context, task string, since time.Time) ([]Run, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+runCols+` FROM runs WHERE (?='' OR task=?) AND started_at>=? ORDER BY started_at`, task, task, ts(since))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Run
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ResultsSince returns the results that finished at or after since, of
+// one task or, with an empty task, of every task, newest first.
+func (s *Store) ResultsSince(ctx context.Context, task string, since time.Time) ([]Result, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id, task, finished_at, pseudo_json, COALESCE(clear_json, '') FROM results WHERE (?='' OR task=?) AND finished_at>=? ORDER BY finished_at DESC`, task, task, ts(since))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Result
+	for rows.Next() {
+		var r Result
+		var fin, pj, cj string
+		if err := rows.Scan(&r.RunID, &r.Task, &fin, &pj, &cj); err != nil {
+			return nil, err
+		}
+		r.FinishedAt = parseTS(fin)
+		r.PseudoJSON = []byte(pj)
+		if cj != "" {
+			r.ClearJSON = []byte(cj)
 		}
 		out = append(out, r)
 	}
@@ -800,13 +939,30 @@ const (
 	FeedNew    = "new"
 	FeedHanded = "handed"
 	FeedSeen   = "seen"
+	// FeedFiltered is an item the prefilter dropped in enforce mode: never
+	// handed to a run, pruned like a seen item.
+	FeedFiltered = "filtered"
+)
+
+// Prefilter decisions recorded on a feed item.
+const (
+	DecisionKeep = "keep"
+	DecisionDrop = "drop"
 )
 
 // FeedItem is one feed entry the host has seen for a task.
 type FeedItem struct {
 	Key, Title, Link, Source string
+	Summary                  string
 	Published, FirstSeen     time.Time
 	State, RunID             string
+	// Prefilter outcome. Scored is false when no score was recorded.
+	Score    float64
+	Scored   bool
+	Match    string
+	Decision string // keep | drop | ""
+	Reason   string // keyword | model | error | off
+	Model    string
 }
 
 // ClaimFeedItems records the fetched items of a task and hands up to limit
@@ -815,6 +971,12 @@ type FeedItem struct {
 // returns them, newest first; the rest stay new for the next run. With an
 // empty runID nothing is claimed; the call only reports what a run would
 // get.
+//
+// An item whose State is FeedFiltered is inserted as filtered: the
+// prefilter dropped it, and no run gets it; a row that already waits as
+// new becomes filtered too. An item with a Decision has its prefilter
+// columns written, also when the row already exists, so a later scoring
+// refreshes the record.
 func (s *Store) ClaimFeedItems(ctx context.Context, task, runID string, items []FeedItem, limit int, now time.Time) ([]FeedItem, error) {
 	if limit <= 0 {
 		limit = 1 << 30
@@ -825,12 +987,34 @@ func (s *Store) ClaimFeedItems(ctx context.Context, task, runID string, items []
 	}
 	defer tx.Rollback()
 	for _, it := range items {
-		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO feed_items (task, key, title, link, source, published, first_seen, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			task, it.Key, it.Title, it.Link, it.Source, ts(it.Published), ts(now), FeedNew); err != nil {
+		state := FeedNew
+		if it.State == FeedFiltered {
+			state = FeedFiltered
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO feed_items (task, key, title, link, source, published, first_seen, state, summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			task, it.Key, it.Title, it.Link, it.Source, ts(it.Published), ts(now), state, it.Summary); err != nil {
 			return nil, err
 		}
+		if it.Decision != "" {
+			var score any
+			if it.Scored {
+				score = it.Score
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE feed_items SET summary=?, score=?, match=?, decision=?, reason=?, model=? WHERE task=? AND key=?`,
+				it.Summary, score, it.Match, it.Decision, it.Reason, it.Model, task, it.Key); err != nil {
+				return nil, err
+			}
+			// A row that waited as new (prefilter off, a failed run, a
+			// ratelimit skip) and is dropped now follows the decision; a
+			// handed or seen row keeps its state.
+			if state == FeedFiltered {
+				if _, err := tx.ExecContext(ctx, `UPDATE feed_items SET state=? WHERE task=? AND key=? AND state=?`, FeedFiltered, task, it.Key, FeedNew); err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT key, title, link, source, published, first_seen, state, run_id FROM feed_items WHERE task=? AND state=? ORDER BY published DESC, first_seen DESC LIMIT ?`, task, FeedNew, limit)
+	rows, err := tx.QueryContext(ctx, feedItemColumns+` WHERE task=? AND state=? ORDER BY published DESC, first_seen DESC LIMIT ?`, task, FeedNew, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -868,8 +1052,8 @@ func (s *Store) RecordFeedItemsSeen(ctx context.Context, task string, items []Fe
 	}
 	defer tx.Rollback()
 	for _, it := range items {
-		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO feed_items (task, key, title, link, source, published, first_seen, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			task, it.Key, it.Title, it.Link, it.Source, ts(it.Published), ts(now), FeedSeen); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO feed_items (task, key, title, link, source, published, first_seen, state, summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			task, it.Key, it.Title, it.Link, it.Source, ts(it.Published), ts(now), FeedSeen, it.Summary); err != nil {
 			return err
 		}
 	}
@@ -890,7 +1074,7 @@ func (s *Store) SettleFeedItems(ctx context.Context, runID string, evaluated boo
 
 // FeedItemsOf returns the items handed to a run.
 func (s *Store) FeedItemsOf(ctx context.Context, runID string) ([]FeedItem, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT key, title, link, source, published, first_seen, state, run_id FROM feed_items WHERE run_id=? ORDER BY published DESC`, runID)
+	rows, err := s.db.QueryContext(ctx, feedItemColumns+` WHERE run_id=? ORDER BY published DESC`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -898,26 +1082,77 @@ func (s *Store) FeedItemsOf(ctx context.Context, runID string) ([]FeedItem, erro
 	return scanFeedItems(rows)
 }
 
-// PruneFeedItems forgets seen items first seen before the cutoff. An item
-// that reappears in a feed after that is new again; feeds rarely keep
-// entries that long.
+// FeedItemStates returns the recorded state of each key the task knows;
+// a key without a row is absent from the map. An item whose Decision is
+// not empty already has a prefilter decision.
+func (s *Store) FeedItemStates(ctx context.Context, task string, keys []string) (map[string]FeedItem, error) {
+	out := map[string]FeedItem{}
+	const chunk = 400
+	for start := 0; start < len(keys); start += chunk {
+		end := min(start+chunk, len(keys))
+		args := make([]any, 0, end-start+1)
+		args = append(args, task)
+		marks := make([]byte, 0, 2*(end-start))
+		for _, k := range keys[start:end] {
+			args = append(args, k)
+			if len(marks) > 0 {
+				marks = append(marks, ',')
+			}
+			marks = append(marks, '?')
+		}
+		rows, err := s.db.QueryContext(ctx, feedItemColumns+` WHERE task=? AND key IN (`+string(marks)+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		items, err := scanFeedItems(rows)
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		for _, it := range items {
+			out[it.Key] = it
+		}
+	}
+	return out, nil
+}
+
+// FeedItemScores returns the items of a task that the prefilter decided,
+// first seen at or after since, best score first.
+func (s *Store) FeedItemScores(ctx context.Context, task string, since time.Time) ([]FeedItem, error) {
+	rows, err := s.db.QueryContext(ctx, feedItemColumns+` WHERE task=? AND decision<>'' AND first_seen>=? ORDER BY score DESC, first_seen DESC`, task, ts(since))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFeedItems(rows)
+}
+
+// PruneFeedItems forgets seen and filtered items first seen before the
+// cutoff. An item that reappears in a feed after that is new again; feeds
+// rarely keep entries that long.
 func (s *Store) PruneFeedItems(ctx context.Context, before time.Time) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM feed_items WHERE state=? AND first_seen<?`, FeedSeen, ts(before))
+	res, err := s.db.ExecContext(ctx, `DELETE FROM feed_items WHERE state IN (?, ?) AND first_seen<?`, FeedSeen, FeedFiltered, ts(before))
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
 }
 
+const feedItemColumns = `SELECT key, title, link, source, published, first_seen, state, run_id, summary, score, match, decision, reason, model FROM feed_items`
+
 func scanFeedItems(rows *sql.Rows) ([]FeedItem, error) {
 	var out []FeedItem
 	for rows.Next() {
 		var it FeedItem
 		var pub, first string
-		if err := rows.Scan(&it.Key, &it.Title, &it.Link, &it.Source, &pub, &first, &it.State, &it.RunID); err != nil {
+		var score sql.NullFloat64
+		if err := rows.Scan(&it.Key, &it.Title, &it.Link, &it.Source, &pub, &first, &it.State, &it.RunID, &it.Summary, &score, &it.Match, &it.Decision, &it.Reason, &it.Model); err != nil {
 			return nil, err
 		}
 		it.Published, it.FirstSeen = parseTS(pub), parseTS(first)
+		if score.Valid {
+			it.Score, it.Scored = score.Float64, true
+		}
 		out = append(out, it)
 	}
 	return out, rows.Err()

@@ -68,6 +68,21 @@ type ImageConfig struct {
 	// CACertificates is a host path (file or directory) of additional CA
 	// certificates baked into the image's trust store at build time.
 	CACertificates string `yaml:"caCertificates"`
+	// Prefilter says how the feed prefilter image is built; see
+	// PrefilterImageConfig.
+	Prefilter PrefilterImageConfig `yaml:"prefilter"`
+}
+
+// PrefilterImageConfig is the recipe of the feed prefilter image: the
+// embedding model exported to ONNX at build time. Model is a Hugging Face
+// repository of a sentence-transformers bi-encoder; Revision pins a commit
+// or tag; Quantize is "int8" (dynamic weight quantization, a quarter of
+// the size, kept only when the build's accuracy check passes, else fp32)
+// or "none".
+type PrefilterImageConfig struct {
+	Model    string `yaml:"model"`
+	Revision string `yaml:"revision"`
+	Quantize string `yaml:"quantize"`
 }
 
 type ClaudeConfig struct {
@@ -221,6 +236,11 @@ func Defaults() Config {
 		Image: ImageConfig{
 			ClaudeVersion: "2.1.301",
 			Autobuild:     true,
+			Prefilter: PrefilterImageConfig{
+				Model:    "cisco-ai/SecureBERT2.0-biencoder",
+				Revision: "main",
+				Quantize: "int8",
+			},
 		},
 		Claude: ClaudeConfig{
 			OAuthTokenSecret:    "claude-oauth-token",
@@ -275,6 +295,14 @@ func (c *Config) Validate() error {
 		if _, _, err := ParseUser(c.Runtime.User); err != nil {
 			return fmt.Errorf("runtime.user: %w", err)
 		}
+	}
+	switch c.Image.Prefilter.Quantize {
+	case "int8", "none":
+	default:
+		return fmt.Errorf("unknown image.prefilter.quantize %q (use: int8, none)", c.Image.Prefilter.Quantize)
+	}
+	if strings.TrimSpace(c.Image.Prefilter.Model) == "" {
+		return fmt.Errorf("image.prefilter.model must name a Hugging Face model")
 	}
 	switch c.Egress.Mode {
 	case "open", "proxy":

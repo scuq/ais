@@ -9,7 +9,7 @@ const (
 	LabelManaged = "io.ais.managed"
 	// LabelSchema versions the label set itself. Value: SchemaVersion.
 	LabelSchema = "io.ais.schema"
-	// LabelRole is what the resource is for: run | proxy | backend | network.
+	// LabelRole is what the resource is for: run | proxy | backend | network | prefilter.
 	LabelRole = "io.ais.role"
 	// LabelTask is the task name a run container belongs to.
 	LabelTask = "io.ais.task"
@@ -28,6 +28,8 @@ const (
 	RoleProxy   = "proxy"
 	RoleBackend = "backend"
 	RoleNetwork = "network"
+	// RolePrefilter is the one-shot container that scores feed items.
+	RolePrefilter = "prefilter"
 )
 
 // BaseLabels returns the labels common to every ais resource.

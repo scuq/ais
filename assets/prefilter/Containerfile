@@ -1,0 +1,61 @@
+# ais prefilter image. Built by `ais prefilter build` from the embedded
+# recipe. It scores feed items against inventory entries with a local
+# embedding model: one process per feed check, no network, one read-only
+# mount, JSON in and JSON out. Every non-obvious line carries its reason.
+#
+# Build args:
+#   MODEL          Hugging Face repository of a sentence-transformers
+#                  bi-encoder (default cisco-ai/SecureBERT2.0-biencoder).
+#   MODEL_REVISION commit, tag or branch to pin.
+#   QUANTIZE       int8 (dynamic weight quantization, about a quarter of
+#                  the size, kept only when its embeddings stay close to
+#                  fp32 on the self-test texts; else fp32 is shipped) or
+#                  none.
+#   SOURCE         hf: export the model here (needs torch at build time,
+#                  a few GB of temporary disk and a few minutes);
+#                  dir: take a pre-exported model from the context
+#                  directory model/ (ais prefilter build --model-dir).
+ARG SOURCE=hf
+
+# --- stage export-hf: export and quantize ----------------------------------
+FROM docker.io/library/python:3.12-slim AS export-hf
+ARG MODEL=cisco-ai/SecureBERT2.0-biencoder
+ARG MODEL_REVISION=main
+ARG QUANTIZE=int8
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 HF_HUB_DISABLE_TELEMETRY=1 TOKENIZERS_PARALLELISM=false
+# torch from the CPU index: the default index pulls CUDA libraries on
+# amd64 (gigabytes) that a CPU export never uses. Below 2.9: optimum's
+# ONNX exporter imports private torch.onnx symbols that 2.9+ removed.
+RUN pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.6,<2.9" \
+    && pip install "transformers>=4.48,<5" "optimum[exporters]>=1.24,<2" "onnx>=1.16,<2" \
+        "onnxruntime>=1.20,<2" "sentence-transformers>=3.3,<6" "tokenizers>=0.20,<1" "numpy>=1.26,<3" \
+        "huggingface_hub>=0.26"
+COPY prefilter.py export.py selftest.json /app/
+RUN python3 /app/export.py --model "$MODEL" --revision "$MODEL_REVISION" --quantize "$QUANTIZE" --out /model
+
+# --- stage export-dir: a model exported elsewhere ---------------------------
+FROM scratch AS export-dir
+COPY model/ /model/
+
+# --- the chosen source -----------------------------------------------------
+FROM export-${SOURCE} AS export
+
+# --- run image: onnxruntime, tokenizers, numpy and the model ---------------
+FROM docker.io/library/python:3.12-slim
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1
+# Acquire::Check-Date=false: see the run image's Containerfile.
+RUN apt-get -o Acquire::Check-Date=false update \
+    && apt-get -o Acquire::Check-Date=false install -y --no-install-recommends libstdc++6 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install "onnxruntime>=1.20,<2" "tokenizers>=0.20,<1" "numpy>=1.26,<3"
+COPY --from=export /model /model
+COPY prefilter.py selftest.json /app/
+# The build fails when the model ranks an unrelated text above a related
+# one: a broken export or pooling never reaches a feed check.
+RUN python3 /app/prefilter.py --selftest /app/selftest.json
+# Strip setuid/setgid; inert under cap-drop=ALL, but no latent path.
+RUN find / -xdev -perm /6000 -type f -exec chmod ug-s {} + 2>/dev/null || true
+RUN groupadd -g 1000 ais && useradd -u 1000 -g 1000 -M -s /usr/sbin/nologin ais
+USER 1000:1000
+ENTRYPOINT ["python3", "/app/prefilter.py"]
+CMD ["/work/in.json"]

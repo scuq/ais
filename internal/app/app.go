@@ -49,6 +49,11 @@ COMMANDS
     feeds <sub>       test [--items] <task>: read the feeds and show what is new,
                       claiming nothing; seen <task>: mark every current item as
                       seen, so the feed checks start from now
+    prefilter <sub>   build [--no-cache] [--model-dir DIR]: build the image of
+                      the local model that scores feed items against the
+                      inventory; test <task>: score the new items and show the
+                      decisions; stats <task> [--since D]: compare the scores
+                      with what the model reported; set <task> key=value
     hook redact       PostToolUse hook (runs inside the container)
     config show       Print the resolved configuration (--json for JSON)
     doctor            Check the engine and host
@@ -92,6 +97,8 @@ func Main(args []string) int {
 		err = cmdDigest(ctx, p, args[1:])
 	case "feeds":
 		err = cmdFeeds(ctx, p, args[1:])
+	case "prefilter":
+		err = cmdPrefilter(ctx, p, args[1:])
 	case "run":
 		return cmdRun(ctx, p, args[1:])
 	case "hook":

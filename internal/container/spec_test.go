@@ -75,3 +75,12 @@ func TestShellQuote(t *testing.T) {
 		t.Errorf("got %s want %s", got, want)
 	}
 }
+
+func TestNoNetwork(t *testing.T) {
+	s := sampleSpec()
+	s.Networks, s.NoNetwork = nil, true
+	got := strings.Join(s.Argv(DockerDialect{}, false), " ")
+	if !strings.Contains(got, "--network none") || strings.Contains(got, "ais-internal") {
+		t.Errorf("argv: %s", got)
+	}
+}

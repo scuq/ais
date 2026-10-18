@@ -1,0 +1,27 @@
+[
+  {
+    "a": "Palo Alto Networks PAN-OS 11.2. Usage: Internet edge firewalls with GlobalProtect portal",
+    "b": "Palo Alto Networks patches actively exploited authentication bypass in PAN-OS management interface",
+    "c": "New smartphone camera sensor promises better low-light photos"
+  },
+  {
+    "a": "Cisco ASA and Firepower Threat Defense. Usage: VPN termination",
+    "b": "Cisco warns of zero-day in ASA and FTD VPN software under active attack",
+    "c": "Local bakery wins regional award for sourdough bread"
+  },
+  {
+    "a": "Keycloak 26. Usage: single sign-on for internal web applications",
+    "b": "Keycloak security advisory: open redirect in OAuth authorization endpoint",
+    "c": "Weather service forecasts a mild and dry weekend"
+  },
+  {
+    "a": "Citrix NetScaler ADC and Gateway. Interest: remote code execution and memory disclosure",
+    "b": "CitrixBleed 2: NetScaler ADC memory overread lets attackers hijack sessions",
+    "c": "City council approves budget for new public library"
+  },
+  {
+    "a": "F5 BIG-IP LTM. Usage: load balancing of web services",
+    "b": "F5 releases fixes for critical BIG-IP configuration utility vulnerability",
+    "c": "Recipe: a quick weeknight pasta with lemon and garlic"
+  }
+]

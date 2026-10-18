@@ -74,7 +74,7 @@ type Outcome struct {
 }
 
 // feedSummary says what the feeds returned, for the row of a quiet run.
-func feedSummary(st []FeedStatus) string {
+func feedSummary(st []FeedStatus, filtered int) string {
 	items, failed := 0, 0
 	for _, f := range st {
 		items += f.Items
@@ -83,10 +83,49 @@ func feedSummary(st []FeedStatus) string {
 		}
 	}
 	s := fmt.Sprintf("%d feed(s), %d item(s), none new", len(st), items)
+	if filtered > 0 {
+		s += fmt.Sprintf(", %d filtered by the prefilter", filtered)
+	}
 	if failed > 0 {
 		s += fmt.Sprintf(", %d feed(s) failed", failed)
 	}
 	return s
+}
+
+// logPrefilter writes one line about what the prefilter did, when it ran.
+func logPrefilter(log *slog.Logger, prep *Prepared) {
+	pf := prep.Prefilter
+	if pf.Kept+pf.Dropped == 0 {
+		return
+	}
+	mode := ""
+	if prep.Task.Feeds != nil && prep.Task.Feeds.Prefilter != nil {
+		mode = prep.Task.Feeds.Prefilter.Mode
+	}
+	args := []any{"run", prep.RunID, "mode", mode, "kept", pf.Kept, "dropped", pf.Dropped, "keyword", pf.Keyword, "scored", pf.Scored, "ms", pf.Duration.Milliseconds(), "model", pf.Model}
+	if pf.Err != "" {
+		log.Warn("prefilter did not score; items kept", append(args, "error", pf.Err)...)
+		return
+	}
+	log.Info("prefilter", args...)
+}
+
+// readUsage reads the CPU time (ms) and peak memory (bytes) that the
+// entrypoint wrote after claude exited; zeros when the file is missing
+// (an older image, or a container that was killed).
+func readUsage(path string) (cpuMS, memPeak int64) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0
+	}
+	var u struct {
+		CPUUsec int64 `json:"cpu_usec"`
+		MemPeak int64 `json:"mem_peak"`
+	}
+	if json.Unmarshal(data, &u) != nil {
+		return 0, 0
+	}
+	return u.CPUUsec / 1000, u.MemPeak
 }
 
 // Succeeded reports whether the run ended in success.
@@ -156,27 +195,32 @@ func (r *Runner) Run(ctx context.Context, t *task.Task, trigger string) (*Outcom
 	}
 
 	opts := r.Opts
-	opts.Trigger, opts.Feeds = trigger, r.Store
+	opts.Trigger, opts.Feeds, opts.Prefilter = trigger, r.Store, r.RT
 	prep, err := Prepare(ctx, r.Cfg, t, r.Store, opts)
 	if errors.Is(err, ErrQuiet) {
-		run := store.Run{ID: prep.RunID, Task: t.Name, TaskHash: t.Hash, State: store.StateSkipped, Trigger: trigger, Engine: r.Opts.Engine, StartedAt: prep.StartedAt, FinishedAt: r.now(), Model: t.Model, Reason: ReasonQuiet, Error: feedSummary(prep.Feeds), Mode: prep.Mode}
+		run := store.Run{ID: prep.RunID, Task: t.Name, TaskHash: t.Hash, State: store.StateSkipped, Trigger: trigger, Engine: r.Opts.Engine, StartedAt: prep.StartedAt, FinishedAt: r.now(), Model: t.Model, Reason: ReasonQuiet, Error: feedSummary(prep.Feeds, len(prep.Filtered)), Mode: prep.Mode}
+		prep.UsageColumns(&run)
 		if err := r.Store.InsertRun(ctx, run); err != nil {
 			return nil, err
 		}
-		log.Info("quiet: no new feed items", "run", run.ID, "feeds", len(prep.Feeds))
+		logPrefilter(log, prep)
+		log.Info("quiet: no new feed items", "run", run.ID, "feeds", len(prep.Feeds), "filtered", len(prep.Filtered))
 		return &Outcome{Run: run}, nil
 	}
 	if errors.Is(err, ErrRateLimited) {
 		run := store.Run{ID: prep.RunID, Task: t.Name, TaskHash: t.Hash, State: store.StateSkipped, Trigger: trigger, Engine: r.Opts.Engine, StartedAt: prep.StartedAt, FinishedAt: r.now(), Model: t.Model, Reason: ReasonRateLimit, Error: err.Error(), Mode: prep.Mode}
+		prep.UsageColumns(&run)
 		if err := r.Store.InsertRun(ctx, run); err != nil {
 			return nil, err
 		}
+		logPrefilter(log, prep)
 		log.Warn("feed check held back: feeds.maxRunsPerDay reached", "run", run.ID, "new_items", len(prep.Feed))
 		return &Outcome{Run: run}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	logPrefilter(log, prep)
 	for _, f := range prep.Feeds {
 		switch {
 		case f.Err != "":
@@ -186,9 +230,10 @@ func (r *Runner) Run(ctx context.Context, t *task.Task, trigger string) (*Outcom
 		}
 	}
 	if prep.Mode == "feed" {
-		log.Info("feed check", "run", prep.RunID, "new_items", len(prep.Feed), "feeds", len(prep.Feeds))
+		log.Info("feed check", "run", prep.RunID, "new_items", len(prep.Feed), "feeds", len(prep.Feeds), "filtered", len(prep.Filtered))
 	}
 	run := store.Run{ID: prep.RunID, Task: t.Name, TaskHash: t.Hash, State: store.StateRunning, Trigger: trigger, Engine: r.Opts.Engine, Dir: prep.RunDir, StartedAt: prep.StartedAt, Model: t.Model, Mode: prep.Mode}
+	prep.UsageColumns(&run)
 	if err := r.Store.InsertRun(ctx, run); err != nil {
 		return nil, err
 	}
@@ -219,6 +264,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task, trigger string) (*Outcom
 
 	log.Info("starting", "run", prep.RunID, "engine", r.Opts.Engine, "model", t.Model)
 	outcome := r.execute(ctx, prep, env, run)
+	outcome.Run.CPUMS, outcome.Run.MemPeak = readUsage(filepath.Join(prep.RunDir, "out", "usage.json"))
 	// Bookkeeping must complete even when ctx was cancelled mid-run; that is
 	// exactly the case where the row must not be left open.
 	ctx = context.WithoutCancel(ctx)

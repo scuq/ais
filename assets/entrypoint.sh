@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 # ais run container entrypoint. Materialises the per-run settings into the
 # tmpfs config dir, reads the claude argv from the mounted input directory
-# and execs claude with the prompt on stdin. Credentials arrive in the
+# and runs claude with the prompt on stdin. Credentials arrive in the
 # environment and never touch a file.
 #
-# AIS_IN_DIR, AIS_CLAUDE_BIN and CLAUDE_CONFIG_DIR are overridable so the
-# test suite can run this file on the host against a fake claude.
+# After claude exits, it writes the CPU time and peak memory of the
+# container (its cgroup v2 counters) to usage.json in the output directory,
+# and exits with claude's code.
+#
+# AIS_IN_DIR, AIS_OUT_DIR, AIS_CGROUP_DIR, AIS_CLAUDE_BIN and
+# CLAUDE_CONFIG_DIR are overridable so the test suite can run this file on
+# the host against a fake claude.
 set -euo pipefail
 
 IN="${AIS_IN_DIR:-/run/ais/in}"
+OUT="${AIS_OUT_DIR:-/run/ais/out}"
+CGROUP="${AIS_CGROUP_DIR:-/sys/fs/cgroup}"
 CLAUDE="${AIS_CLAUDE_BIN:-claude}"
 CFG="${CLAUDE_CONFIG_DIR:-/run/ais/cfg/claude}"
 HOME="${HOME:-/run/ais/home/ais}"
@@ -49,5 +56,34 @@ if [ "${#ARGV[@]}" -eq 0 ]; then
     exit 78
 fi
 
-# exec: claude becomes tini's child, so a `stop` reaches it directly.
-exec "$CLAUDE" "${ARGV[@]}" < "$IN/prompt.md"
+# claude runs as a child so that this script can read the usage after it
+# exits. tini sends a `stop` to this script; the trap passes it on, and the
+# loop waits until claude has really exited.
+"$CLAUDE" "${ARGV[@]}" < "$IN/prompt.md" &
+pid=$!
+trap 'kill -TERM "$pid" 2>/dev/null || true' TERM INT HUP
+rc=0
+wait "$pid" || rc=$?
+while kill -0 "$pid" 2>/dev/null; do
+    rc=0
+    wait "$pid" || rc=$?
+done
+trap - TERM INT HUP
+
+# Usage: best effort. A missing counter is 0, a failed write is ignored.
+cpu=0 user=0 sys=0 peak=0
+if [ -r "$CGROUP/cpu.stat" ]; then
+    while read -r key val; do
+        case "$key" in
+            usage_usec) cpu=$val ;;
+            user_usec) user=$val ;;
+            system_usec) sys=$val ;;
+        esac
+    done < "$CGROUP/cpu.stat"
+fi
+if [ -r "$CGROUP/memory.peak" ]; then
+    read -r peak < "$CGROUP/memory.peak" || peak=0
+fi
+printf '{"cpu_usec":%d,"user_usec":%d,"system_usec":%d,"mem_peak":%d}\n' "$cpu" "$user" "$sys" "$peak" \
+    > "$OUT/usage.json" 2>/dev/null || true
+exit "$rc"

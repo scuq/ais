@@ -54,6 +54,9 @@ type Spec struct {
 	// the egress enforcement; the proxy env vars in Env only tell tools where
 	// the one door is.
 	Networks []NetworkAttach
+	// NoNetwork renders --network none: no interface at all. A container
+	// that only reads a mounted file needs no network.
+	NoNetwork bool
 
 	Labels map[string]string
 
@@ -115,6 +118,9 @@ func (s *Spec) Argv(d Dialect, selinuxRelabel bool) []string {
 		} else {
 			args = append(args, "--env", fmt.Sprintf("%s=%s", e.Name, e.Value))
 		}
+	}
+	if s.NoNetwork {
+		args = append(args, "--network", "none")
 	}
 	for _, n := range s.Networks {
 		args = append(args, d.NetworkArgs(n)...)

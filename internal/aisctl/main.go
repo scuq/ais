@@ -37,6 +37,11 @@ COMMANDS
                 and addresses, so their output can go to a model
     prompts [list [--task T] [-n N]] | show RUN-ID | last [--task T]
                 The prompts that were sent to the model, including dry runs
+    report [--task T] [--windows 24h,7d,30d] [--runs] [--json]
+                What ran and what it cost, per window: feed fetches and items,
+                prefilter runs and decisions, model runs, turns, tokens and
+                estimated price, CPU time and peak memory of the containers,
+                findings; --runs lists every run of the first window
     run TASK [--live] [--dry-run]
                 Start a manual run now; --live streams the model's progress
     redact approve [--force] [--no-start]
@@ -104,6 +109,8 @@ func Main(args []string) int {
 		err = runInventory(ctx, e, args[1:])
 	case "prompts":
 		err = Prompts(ctx, e, args[1:])
+	case "report":
+		err = runReport(ctx, e, args[1:])
 	case "run":
 		return app.Main(append([]string{"run"}, args[1:]...))
 	case "status":

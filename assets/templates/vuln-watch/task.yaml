@@ -61,6 +61,15 @@ allowedTools: [WebFetch, WebSearch, "mcp__inventory__*"]
 feeds:
   fullSchedule: "7 20 * * *"
   maxRunsPerDay: 12             # scheduled feed checks that may start the model in 24 h
+  # The host scores every new item against the inventory with a local
+  # embedding model before a run (image: 'ais prefilter build'). A vendor
+  # or product name in the item always keeps it. shadow records the scores
+  # and hands every item to the model; 'ais prefilter stats vuln-watch'
+  # then shows whether the threshold would have dropped a reported item.
+  # enforce withholds items below the threshold. An error keeps every item.
+  prefilter:
+    mode: shadow                # off | shadow | enforce
+    threshold: 0.45
   urls:
     - https://feeds.feedburner.com/TheHackersNews
     - https://www.cert.at/cert-at.de.warnings.rss_2.0.xml
@@ -84,6 +93,9 @@ feeds:
     - https://blog.talosintelligence.com/rss/
     - https://www.tenable.com/blog/feed
     - https://www.greynoise.io/blog/rss.xml
+    - https://www.bleepingcomputer.com/feed/
+    - https://www.zerodayinitiative.com/rss/published/
+    - https://isc.sans.edu/rssfeed_full.xml
 
 # WebFetch runs inside the container, so every feed host must be listed.
 # WebSearch is server-side and needs nothing here. A leading dot allows the
@@ -142,8 +154,10 @@ prompt: |
   inventoried product; skip the rest without fetching them. Fetch an item that can, verify it against
   the vendor advisory and NVD (use WebSearch only to find the advisory of that specific item), and
   report findings as described below.
+  An item marked [matches ...] was matched by the host's prefilter to an inventory entry; check those
+  first. An unmarked item can still concern an inventoried product.
   New items:
-  {{ range .Feed }}- {{ .Source }}: {{ .Title }} — {{ .Link }}{{ with .Summary }} ({{ . }}){{ end }}
+  {{ range .Feed }}- {{ .Source }}: {{ .Title }} — {{ .Link }}{{ with .Summary }} ({{ . }}){{ end }}{{ with .Match }} [matches {{ . }}]{{ end }}
   {{ end }}{{ else }}This is the full daily check.
   Check these sources for vulnerabilities, zero-days and critical advisories published in the last 24 hours.
   Primary: The Hacker News (thehackernews.com, RSS at feeds.feedburner.com/TheHackersNews), CERT.at (cert.at),

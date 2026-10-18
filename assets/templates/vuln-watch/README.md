@@ -24,11 +24,46 @@ and checks the other items. To force the full check, run
 `ais run --full vuln-watch`. To see what the feeds return, run
 `ais feeds test vuln-watch`.
 
+Prefilter: the block `feeds.prefilter` scores each new feed item against the
+inventory on the host, before the model sees it. A vendor or product name of
+the inventory in the item always keeps it. A local embedding model scores the
+other items in a container without a network. If the score is at least
+`threshold` (0.45), ais keeps the item. The template sets `mode: shadow`: ais
+records the scores, and every item still goes to the model. In the prompt, an
+item that the prefilter kept has the mark `[matches <vendor product version>]`.
+If the prefilter cannot score, ais keeps every item.
+
+To use the prefilter, build the image once with `ais prefilter build`. The
+first build downloads torch and the model, takes several minutes, and needs a
+few gigabytes of temporary disk. The daemon does not build the image. It logs a
+warning at start if the image is missing, and `ais doctor` checks it.
+
+To tune the prefilter:
+
+1. Leave the task in `shadow` mode for several days.
+2. Run `ais prefilter test vuln-watch` to see the decision for each current
+   new item. The command claims no item.
+3. Run `ais prefilter stats vuln-watch`. It compares the recorded scores with
+   the items that the model reported or checked, and it shows the lowest score
+   of a reported item.
+4. If every reported item scored at least the threshold, run
+   `ais prefilter set vuln-watch mode=enforce`. Then send SIGHUP to the daemon.
+   In `enforce` mode, ais records an item below the threshold as `filtered`
+   and does not give it to the model. If every new item is filtered, the run is
+   quiet.
+5. If a reported item scored below the threshold, lower it with
+   `ais prefilter set vuln-watch threshold=0.40`, or stay in `shadow` mode.
+
+The model is trained on English text. For the German feeds (heise Security and
+CERT.at), the keyword pass still matches product names in any language.
+`ais prefilter set vuln-watch mode=off` turns the prefilter off.
+
 Feeds: The Hacker News, CERT.at (warnings and all), heise Security (alerts and
 news), CISA KEV (JSON), CISA advisories, CERT-EU advisories, Infosecurity
 Magazine, r/netsec, Palo Alto Networks, Cisco PSIRT, Fortinet PSIRT, MSRC,
-Keycloak releases, watchTowr, Rapid7, Unit 42, Horizon3, Talos, Tenable, and
-GreyNoise. These are 22 URLs.
+Keycloak releases, watchTowr, Rapid7, Unit 42, Horizon3, Talos, Tenable,
+GreyNoise, BleepingComputer, Zero Day Initiative (published advisories), and
+SANS Internet Storm Center. These are 25 URLs.
 
 No feed: Citrix bulletins, F5, GitHub Security Advisories, Qualys, OpenBSD,
 Red Hat, FTAPI, Kemp, Sophos, Arctic Wolf, and VulnCheck. Only the daily full run

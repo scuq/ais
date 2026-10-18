@@ -140,3 +140,38 @@ func TestFeedsKey(t *testing.T) {
 		}
 	}
 }
+
+func TestPrefilterKey(t *testing.T) {
+	tk := mustParse(t, minimal+"feeds: {urls: [https://a.example/rss]}\n")
+	if tk.Feeds.Prefilter.Enabled() || tk.Feeds.Prefilter.Enforces() || !tk.Feeds.Prefilter.UseKeywords() {
+		t.Errorf("no prefilter: %+v", tk.Feeds.Prefilter)
+	}
+	tk = mustParse(t, minimal+"feeds: {urls: [https://a.example/rss], prefilter: {mode: shadow}}\n")
+	p := tk.Feeds.Prefilter
+	if p == nil || !p.Enabled() || p.Enforces() || p.Threshold != DefaultPrefilterThreshold || p.Image != DefaultPrefilterImage || p.Timeout != DefaultPrefilterTimeout || p.MaxTokens != DefaultPrefilterMaxTokens || !p.UseKeywords() {
+		t.Errorf("defaults: %+v", p)
+	}
+	tk = mustParse(t, minimal+"feeds: {urls: [https://a.example/rss], prefilter: {mode: enforce, threshold: 0.6, keywords: false, timeout: 30s, maxTokens: 64, image: x/y:z}}\n")
+	p = tk.Feeds.Prefilter
+	if !p.Enforces() || p.Threshold != 0.6 || p.UseKeywords() || p.Timeout != 30*time.Second || p.MaxTokens != 64 || p.Image != "x/y:z" {
+		t.Errorf("explicit: %+v", p)
+	}
+	tk = mustParse(t, minimal+"feeds: {urls: [https://a.example/rss], prefilter: {threshold: 0.5}}\n")
+	if tk.Feeds.Prefilter.Mode != PrefilterOff || tk.Feeds.Prefilter.Enabled() {
+		t.Errorf("mode defaults to off: %+v", tk.Feeds.Prefilter)
+	}
+	for name, doc := range map[string]string{
+		"bad mode":      minimal + "feeds: {urls: [https://a.example/rss], prefilter: {mode: maybe}}\n",
+		"bad threshold": minimal + "feeds: {urls: [https://a.example/rss], prefilter: {mode: shadow, threshold: 1.5}}\n",
+		"no image":      minimal + "feeds: {urls: [https://a.example/rss], prefilter: {mode: shadow, image: ' '}}\n",
+		"bad tokens":    minimal + "feeds: {urls: [https://a.example/rss], prefilter: {mode: shadow, maxTokens: -1}}\n",
+	} {
+		tk, err := Parse([]byte(doc), defs)
+		if err == nil {
+			err = tk.Validate()
+		}
+		if err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

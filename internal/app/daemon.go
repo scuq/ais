@@ -19,6 +19,7 @@ import (
 	"github.com/scuq/ais/internal/config"
 	"github.com/scuq/ais/internal/doctor"
 	"github.com/scuq/ais/internal/egress"
+	"github.com/scuq/ais/internal/image"
 	"github.com/scuq/ais/internal/output"
 	"github.com/scuq/ais/internal/pseudo"
 	"github.com/scuq/ais/internal/runner"
@@ -155,6 +156,7 @@ func cmdDaemon(ctx context.Context, p *output.Printer, args []string) error {
 	if err := ensureImage(ctx, p, rt, cfg, true); err != nil {
 		return err
 	}
+	warnPrefilterImages(ctx, rt, cfg, tasks, log)
 	st, err := store.Open(filepath.Join(cfg.StateDir(), "ais.db"))
 	if err != nil {
 		return err
@@ -372,6 +374,29 @@ func configOutsidePIIChanged(a, b *config.Config) bool {
 	ra, _ := config.Render(ca)
 	rb, _ := config.Render(cb)
 	return ra != rb
+}
+
+// warnPrefilterImages logs a warning for every prefilter image a task
+// needs that is missing or stale. The daemon never builds it: the export
+// downloads torch and the model, which is an operator's decision.
+func warnPrefilterImages(ctx context.Context, rt runtime.Runtime, cfg *config.Config, tasks []*task.Task, log *slog.Logger) {
+	seen := map[string]bool{}
+	for _, t := range tasks {
+		if t.Feeds == nil || !t.Feeds.Prefilter.Enabled() || seen[t.Feeds.Prefilter.Image] {
+			continue
+		}
+		ref := t.Feeds.Prefilter.Image
+		seen[ref] = true
+		exists, current, err := image.PrefilterIsCurrent(ctx, rt, cfg, ref)
+		switch {
+		case err != nil:
+			log.Warn("prefilter image check failed", "image", ref, "error", err)
+		case !exists:
+			log.Warn("prefilter image missing; feed items are kept unscored until it is built", "image", ref, "task", t.Name, "hint", "ais prefilter build")
+		case !current:
+			log.Warn("prefilter image was built from another recipe or model", "image", ref, "hint", "ais prefilter build")
+		}
+	}
 }
 
 // sweepOrphans closes run rows left in running/queued by a process that

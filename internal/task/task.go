@@ -107,7 +107,56 @@ type Feeds struct {
 	// items wait. Default 12; 0 means no cap. Full and manual runs do not
 	// count.
 	MaxRunsPerDay *int `yaml:"maxRunsPerDay"`
+	// Prefilter scores each new item against the inventory on the host
+	// with a local embedding model before a run; see Prefilter.
+	Prefilter *Prefilter `yaml:"prefilter"`
 }
+
+// Prefilter is the host-side relevance filter for feed items: a one-shot
+// container with a local embedding model scores every new item against the
+// inventory, and a keyword pass on vendor and product names runs first. In
+// mode "shadow" the scores are recorded and every item is still handed to
+// the model; in mode "enforce" an item below Threshold without a keyword
+// hit is recorded as filtered and never handed. "off" disables it. Any
+// error in the filter keeps every item: a missed vulnerability costs more
+// than a model turn.
+type Prefilter struct {
+	Mode      string  `yaml:"mode"`      // off | shadow | enforce
+	Threshold float64 `yaml:"threshold"` // cosine similarity, default 0.45
+	Image     string  `yaml:"image"`     // default localhost/ais-prefilter:latest
+	// Timeout bounds one scoring container. Default 120s.
+	Timeout time.Duration `yaml:"timeout"`
+	// Keywords enables the lexical pass; nil means true.
+	Keywords *bool `yaml:"keywords"`
+	// MaxTokens caps the tokens of one item text. Default 128.
+	MaxTokens int `yaml:"maxTokens"`
+}
+
+// Prefilter modes.
+const (
+	PrefilterOff     = "off"
+	PrefilterShadow  = "shadow"
+	PrefilterEnforce = "enforce"
+)
+
+// Defaults of the prefilter.
+const (
+	DefaultPrefilterThreshold = 0.45
+	DefaultPrefilterImage     = "localhost/ais-prefilter:latest"
+	DefaultPrefilterTimeout   = 120 * time.Second
+	DefaultPrefilterMaxTokens = 128
+)
+
+// Enabled reports whether the prefilter runs (shadow or enforce).
+func (p *Prefilter) Enabled() bool {
+	return p != nil && p.Mode != "" && p.Mode != PrefilterOff
+}
+
+// Enforces reports whether a dropped item is withheld from the model.
+func (p *Prefilter) Enforces() bool { return p != nil && p.Mode == PrefilterEnforce }
+
+// UseKeywords reports whether the lexical pass runs.
+func (p *Prefilter) UseKeywords() bool { return p == nil || p.Keywords == nil || *p.Keywords }
 
 // DefaultFeedMaxAge is the age past which a feed item is never new.
 const DefaultFeedMaxAge = 7 * 24 * time.Hour
@@ -305,6 +354,23 @@ func Parse(data []byte, d Defaults) (*Task, error) {
 		if t.Feeds.MaxAge == 0 {
 			t.Feeds.MaxAge = DefaultFeedMaxAge
 		}
+		if p := t.Feeds.Prefilter; p != nil {
+			if p.Mode == "" {
+				p.Mode = PrefilterOff
+			}
+			if p.Threshold == 0 {
+				p.Threshold = DefaultPrefilterThreshold
+			}
+			if p.Image == "" {
+				p.Image = DefaultPrefilterImage
+			}
+			if p.Timeout == 0 {
+				p.Timeout = DefaultPrefilterTimeout
+			}
+			if p.MaxTokens == 0 {
+				p.MaxTokens = DefaultPrefilterMaxTokens
+			}
+		}
 	}
 	if t.Timeout == 0 {
 		t.Timeout = d.Timeout
@@ -443,6 +509,22 @@ func (t *Task) Validate() error {
 		}
 		if f.MaxRunsPerDay != nil && *f.MaxRunsPerDay < 0 {
 			return errors.New("feeds.maxRunsPerDay must not be negative")
+		}
+		if p := f.Prefilter; p != nil {
+			switch p.Mode {
+			case PrefilterOff, PrefilterShadow, PrefilterEnforce:
+			default:
+				return fmt.Errorf("feeds.prefilter.mode %q (use: off, shadow, enforce)", p.Mode)
+			}
+			if p.Threshold <= 0 || p.Threshold > 1 {
+				return errors.New("feeds.prefilter.threshold must be in (0, 1]")
+			}
+			if strings.TrimSpace(p.Image) == "" {
+				return errors.New("feeds.prefilter.image must name an image")
+			}
+			if p.Timeout <= 0 || p.MaxTokens <= 0 {
+				return errors.New("feeds.prefilter.timeout and feeds.prefilter.maxTokens must be positive")
+			}
 		}
 	}
 	if d := t.Digest; d != nil {

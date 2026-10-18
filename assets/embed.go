@@ -6,7 +6,7 @@ import "embed"
 
 // FS holds every embedded asset.
 //
-//go:embed Containerfile entrypoint.sh squid.conf.tmpl allowlists examples systemd templates
+//go:embed Containerfile entrypoint.sh squid.conf.tmpl allowlists examples systemd templates prefilter
 var FS embed.FS
 
 // Templates lists the embedded task templates by name.

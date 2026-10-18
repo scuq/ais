@@ -11,6 +11,9 @@
     ais sinks list | test <sink> [--run RUN-ID] [--print]
     ais digest <task> [--print] [--window D]
     ais feeds test [--items] <task> | ais feeds seen <task>
+    ais prefilter build [--no-cache] [--tag REF] [--model-dir DIR]
+    ais prefilter test [--rescore] [--keep] <task> | stats [--since D] [--json] <task>
+    ais prefilter set <task> key=value...
     ais templates list [--json] | show <name> | use <name> [--as NAME] [--force]
     ais runs list [--task T] [--state S] [-n N] [--json]
     ais runs show [--clear] [--prompt] [--json] <run-id>
@@ -53,6 +56,8 @@ A sink (delivery target) is a webhook, NATS JetStream, Splunk HTTP Event Collect
 The container has no route to the network. It reaches only a proxy that allows a list of domains.
 The inventory is not in the container. The model gets pseudonyms (stable replacement tokens) instead of sensitive values.
 The map from pseudonym to real value stays on the host.
+
+A task that reads feeds can also use a prefilter. Before a feed run, the host scores each new feed item against the inventory with a small local model. The model runs in a separate container without a network. The prefilter keeps items that cannot concern the inventory away from Claude Code. See Prefilter.
 
 ## Quickstart
 
@@ -239,6 +244,11 @@ A path can start with `~/` and can contain environment variables.
 | `image.claudeVersion` | `2.1.301` | Version of the Claude Code package in the image. |
 | `image.autobuild` | `true` | If the image is missing or stale, `ais run` and `ais daemon` build it. |
 | `image.caCertificates` | empty | Host path of a file or a directory. ais adds the `*.crt` and `*.pem` files to the trust store of the image at build time. |
+| `image.prefilter.model` | `cisco-ai/SecureBERT2.0-biencoder` | Hugging Face repository of a sentence-transformers bi-encoder. `ais prefilter build` exports it to ONNX. It must not be empty. |
+| `image.prefilter.revision` | `main` | Commit, tag, or branch of the model. |
+| `image.prefilter.quantize` | `int8` | `int8` or `none`. `int8` stores the weights as 8-bit integers, and the model is about a quarter of the size. The build keeps `int8` only when its embeddings stay close to the fp32 ones on the self-test texts; if not, it ships the fp32 model. Any other value is an error. |
+
+The keys `image.prefilter.*` set how `ais prefilter build` builds the prefilter image. They are part of its recipe hash. A change makes the image stale.
 
 ### claude
 
@@ -702,6 +712,7 @@ To change top-level keys without an editor, use `ais tasks set`.
 | `feeds.timeout` | `30s` | Time limit for the fetch of one feed. |
 | `feeds.maxAge` | `168h` | An item published longer ago than this is recorded as seen and never goes to a run. A feed that rotates old entries would otherwise show them as new. An item without a date counts as fresh. |
 | `feeds.maxRunsPerDay` | `12` | Cap on the scheduled feed runs that start the model in any 24 hours. A tick past the cap is recorded as `skipped` with the reason `ratelimit`, and its items wait for a later tick. `0` means no cap. Full runs and manual runs do not count and are not held back. |
+| `feeds.prefilter` | none | Map that scores new feed items on the host before a run. See Prefilter. `ais prefilter set` changes it. |
 
 Exactly one of `outputSchema` and `outputSchemaFile` is necessary. ais compiles the schema when it loads the task.
 
@@ -772,13 +783,79 @@ A source without a usable feed needs the full run. The daily full run of the tem
 To test the feeds of a task, run `ais feeds test vuln-watch`. To see what the next feed run would get, run `ais run --dry-run vuln-watch`. Neither command claims an item. Before the first feed check of a task, run `ais feeds seen vuln-watch`: it marks every item that the feeds hold now as seen, so the first check reports only what appears after that, instead of the whole backlog.
 To use feed checks in an existing task, add the `feeds` block and the two-mode prompt from the template. You can also install the template again with `ais templates use vuln-watch --force`.
 
+#### Prefilter
+
+The prefilter decides on the host which new feed items go to the model. It saves turns on items that cannot concern an inventoried product. The task key `feeds.prefilter` turns it on. It applies to feed runs only. A full run does not use it.
+
+Scoring has two passes:
+
+1. Lexical pass. If the title or summary of an item contains a vendor name or a product name of the inventory, ais keeps the item. The match is on whole words. The lexical pass also uses the words of the free-text inventory lines that start with an uppercase letter. A hit always keeps the item.
+2. Embedding pass. A one-shot container runs a local embedding model on the items without a hit. The score of an item is the cosine similarity to the closest inventory target. If the score is at least `threshold`, ais keeps the item. If not, ais drops it.
+
+The targets are the groups and free-text lines that the prompt shows, after pseudonymization. The model sees no more than Claude Code sees.
+ais scores an item once. An item with a recorded decision is not scored again, unless you run `ais prefilter test --rescore`.
+
+The scoring container has no network, a read-only root filesystem, and no capabilities. It has one read-only mount of the directory `prefilter` in the run directory. The directory holds `in.json`. ais saves the result as `out.json` and the error output as `err.log`.
+
+If scoring fails, ais keeps every item without a decision and logs the error. The causes are a missing image, a timeout, and an output that ais cannot read. The daemon never drops an item because the model did not run.
+
+The keys of `feeds.prefilter` are:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `mode` | `off` | `off`, `shadow`, or `enforce`. The template `vuln-watch` sets `shadow`. |
+| `threshold` | `0.45` | Lowest score that keeps an item. The value must be more than 0 and at most 1. |
+| `image` | `localhost/ais-prefilter:latest` | Prefilter image. |
+| `timeout` | `120s` | Time limit of one scoring container. |
+| `keywords` | `true` | If `false`, ais skips the lexical pass. |
+| `maxTokens` | `128` | Maximum number of tokens that the model reads from one item. |
+
+The modes are:
+
+- `off`: ais does not score.
+- `shadow`: ais scores the items and records the scores. Every item still goes to the model.
+- `enforce`: ais records an item that is below `threshold` and has no keyword hit as `filtered`. The item never goes to the model.
+
+In the prompt of the template `vuln-watch`, a kept item has the mark `[matches <vendor product version>]`. This is the inventory entry that matched. In `shadow` mode, an item that ais would drop goes to the model without a mark.
+If every new item is filtered, the run is quiet. It has the reason `quiet`, and ais starts no Claude Code container. The column `error` of the run shows `N filtered by the prefilter`.
+
+To build the prefilter image, run `ais prefilter build`. The first build downloads torch and the model. It takes several minutes and a few gigabytes of temporary disk space. The build runs a self-test: the model must score a related pair above an unrelated text. To use a model that you exported elsewhere with `assets/prefilter/export.py`, give `--model-dir DIR`.
+The daemon never builds the image. At start it logs a warning if the image of a task is missing or stale. `ais doctor` checks the image too.
+
+The recommended procedure:
+
+1. Build the image.
+
+        ais prefilter build
+
+2. Run the task in `shadow` mode for several days. The template does this.
+
+        ais prefilter set vuln-watch mode=shadow
+
+3. Look at the decisions for the current new items. The command claims no item.
+
+        ais prefilter test vuln-watch
+
+4. Compare the recorded scores with what the model reported.
+
+        ais prefilter stats vuln-watch
+
+5. If every reported item scored at least the threshold, switch to `enforce`. Then send SIGHUP to the daemon.
+
+        ais prefilter set vuln-watch mode=enforce
+
+If `stats` shows a reported item below the threshold, lower `threshold` or stay in `shadow` mode. A reported item is an item that the model used in `findings[].source_urls`.
+
+The model is trained on English text. For German feeds, such as heise and CERT.at, the lexical pass still matches product names in any language.
+On a host with 2 vCPUs (arm64), one scoring container with the fp32 model (568 MB) started, loaded the model, and scored 36 items in 6 s. For `cisco-ai/SecureBERT2.0-biencoder`, the build ships fp32: every `int8` variant failed the accuracy check.
+
 ## Commands
 
 | Command | Meaning |
 |---|---|
 | `ais daemon` | Run the scheduler, the backend, and the sink dispatcher in the foreground. |
 | `ais run <task>` | Run one task now. The trigger is `manual`. |
-| `ais run --dry-run <task>` | Write the input files, print the container command and the file list, and start nothing. For a task with `feeds`, it first prints each feed with its item count or error. Then it prints the new items, or says that the daemon would record a quiet run. It claims no item. |
+| `ais run --dry-run <task>` | Write the input files, print the container command and the file list, and start no run container. For a task with `feeds`, it first prints each feed with its item count or error. Then it prints the new items, or says that the daemon would record a quiet run. It claims no item. If the task has a prefilter, the command scores the items. It prints the decision of each item and the items that the prefilter withholds. |
 | `ais run --full <task>` | For a task with `feeds`, do the full check with web search and not the feed check. |
 | `ais run --engine E <task>` | Use the engine `docker` or `podman` for this run. |
 | `ais run --live <task>` | Show the progress of the run on standard error while it runs. `--follow` is an alias. See Live runs. |
@@ -799,6 +876,10 @@ To use feed checks in an existing task, add the `feeds` block and the two-mode p
 | `ais digest <task>` | Build the digest for the window that ends now and send it to the sinks of the task at once. ais tries once and does not queue it. `--print` prints the Webex markdown and sends nothing. `--window D` sets the window, as a duration such as `24h` or `168h`. Default: `digest.window` of the task, or `24h` if the task has no `digest` key. It works for a task without a `digest` key. |
 | `ais feeds test <task>` | Fetch the feeds of the task and print the table `FEED`, `ITEMS`, `NEWEST`, and `STATUS`. Then print the number of distinct items and the number of new items for the next feed check. `--items` lists the new items. It claims no item. |
 | `ais feeds seen <task>` | Fetch the feeds of the task and mark every item as seen, without a run. Use it once before the first feed check, so the backlog does not go to the model. |
+| `ais prefilter build` | Build the prefilter image from the recipe in the binary. `--no-cache` ignores the layer cache. `--tag REF` sets the image reference (default `localhost/ais-prefilter:latest`). `--model-dir DIR` takes a model that you exported with `assets/prefilter/export.py`. |
+| `ais prefilter test <task>` | Score the current new items of the task and print the columns `SCORE`, `DECISION`, `WHY`, `MATCH`, `SOURCE`, and `TITLE`. It claims no item, but it records the decisions. An item with a recorded decision is not scored again, unless you give `--rescore`. `--keep` keeps the run directory with the input and output of the model. |
+| `ais prefilter stats <task>` | Compare the recorded scores with the results of the model. It counts the items that the model reported (`findings[].source_urls`) or checked (`checked[].url`). It prints a histogram of the scores, the lowest score of a reported item, and a verdict on the threshold. `--since D` sets the window (default `168h`). `--json` prints JSON. |
+| `ais prefilter set <task> key=value...` | Change a key of `feeds.prefilter` in the task file. The keys are `mode`, `threshold`, `image`, `timeout`, `keywords`, and `maxTokens`. The command checks the new file and keeps a backup. Then send SIGHUP to the daemon. |
 | `ais runs redeliver <run-id>` | Queue all deliveries of the run again. `--sink S` limits it to one sink. |
 | `ais image build` | Build the run image from the recipe in the binary. `--no-cache` ignores the layer cache. |
 | `ais image status` | Print whether the image exists and matches the recipe of this binary. |
@@ -831,6 +912,7 @@ To use feed checks in an existing task, add the `feeds` block and the two-mode p
 | `aisctl redact test` | Print the redaction policy and its hash. Run samples through the policy, and list inventory values that it does not cover. `--text T` adds your text. `--stdin` adds text from standard input. `--inventory FILE` uses another inventory, and `--format csv\|json\|yaml\|mdj` sets its format. `--task NAME` applies the `fields` of that task. Without it, a policy based on the column names applies. This policy scrubs fields named `usage` or `interest`, and fields with `descr`, `comment`, `note`, or `remark` in the name. `--json` prints the report as JSON. The report shows every record before and after redaction. |
 | `aisctl inventory ...` | Maintain the inventory file. See Maintaining the inventory. |
 | `aisctl redact approve` | Run the test, and write `pii.approvedHash` to `config.yaml`. It stops if inventory values are not covered, unless you give `--force`. Then it starts the unit if the unit is enabled and not running, or sends SIGHUP if the unit is running. The new policy applies to the next run. `--no-start` skips this last step. |
+| `aisctl report` | Print what ais ran and what it cost, with one column for each window. See Usage report. `--task T` limits it to one task. `--windows LIST` sets the windows (default `24h,7d,30d`). `--runs` lists every run of the first window. `--json` prints JSON. |
 | `aisctl prompts list` | List the logged prompts from `prompts.ndjson`, newest first, with dry runs. `--task T` and `-n N` limit the list. `aisctl prompts` alone does the same. |
 | `aisctl prompts last` | Show the newest prompt. `--task T` limits it to one task. |
 | `aisctl prompts show <run-id>` | Show the system prompt and the prompt of a run, with the SHA-256 hash and the size in bytes. It reads the database first and then `prompts.ndjson`. |
@@ -910,6 +992,45 @@ They still drive `maxBudgetUsd` and `scheduler.dailyBudgetUsd`.
 `ais tasks set <task> key=value...` changes top-level keys of a task file in place. The keys are `model`, `effort`, `schedule`, `jitter`, `timeout`, `maxTurns`, `maxBudgetUsd`, `enabled`, `overlap`, and `sinks`. For `sinks`, write a comma-separated list, for example `sinks=webex,splunk`.
 The command keeps the comments and the other keys. It checks the new file before it replaces the old one. It keeps the old file as `<name>.bak-<timestamp>`. Then it tells you to send SIGHUP to the daemon.
 To map a task to sinks, use `ais tasks set <task> sinks=a,b` or edit `sinks:` in the task file.
+
+### Usage report
+
+`aisctl report` reads the database and prints one column for each window. A window ends now. The suffix `d` means days, so `7d` is 168 hours. A run counts in a window if it started in the window. A result counts if it finished in the window.
+
+    aisctl report --task vuln-watch --windows 24h,7d
+
+The report has these sections:
+
+| Section | Rows |
+|---|---|
+| `TICKS` | Runs recorded, feed checks, full checks, older rows without a mode, succeeded, failed, quiet, held back by the cap, and other skips. |
+| `FEEDS (host)` | Fetches, fetches with figures, feeds read, feeds failed, items fetched, new items to the model, and items withheld by the prefilter. Also the fetch time (total, per fetch, longest). |
+| `PREFILTER (local model)` | Runs, errors, keyword hits, scored, kept, dropped, drop rate, wall time (total, per run, longest), CPU time, and peak memory. |
+| `MODEL (online)` | Runs, turns, tokens in (uncached, cache read, cache write), tokens out, estimated cost (total and per run), wall time, container CPU time, and peak memory. |
+| `RESULTS` | Results, new findings, updates, and items checked. An update is a finding with `previously_reported`. |
+| `TOTAL` | Container CPU time, wall time, and estimated cost. |
+
+The sources of the figures are:
+
+- Tokens, turns, cost, and wall time of the model come from the result of Claude Code. Their rows go back to the first run.
+- The dollar figures are estimates at API list prices. The billing line says `subscription`.
+- The feed and prefilter figures come from the host. `Prepared.UsageColumns` records them for every feed tick, also for `quiet` and `ratelimit` rows.
+- Both containers read their own cgroup v2 counters, `cpu.stat` (`usage_usec`) and `memory.peak`. This works with docker and podman, because each container has a private cgroup namespace.
+- The run container writes the counters to `out/usage.json` after `claude` exits. The prefilter container prints them in the field `usage` of its output.
+- The feed, prefilter, CPU, and memory figures start with the version that added them. Older rows have none.
+- In a CPU row, "x of y" means that only x of y runs reported CPU time and memory.
+
+`--runs` lists every run of the first window. The columns are:
+
+- Start time, task, mode, and outcome
+- Feeds: items, feeds, and failed feeds
+- New items, with the withheld items after a minus sign
+- Prefilter: wall time, kept and total items, and error
+- Model: wall time, turns, tokens in and out, and cost
+- CPU time and memory
+
+The last line shows the CPU time and the memory of the ais daemon since its start. The values come from `systemctl --user show ais.service`. The containers are not part of them.
+`--json` prints the document `{report, daemon}`.
 
 ### Token format
 
@@ -1138,6 +1259,8 @@ Each run has a directory `<stateDir>/runs/<task>/<run-id>/`:
 |---|---|
 | `in/` | Input files, read-only in the container: `prompt.md`, `system.md`, `schema.json`, `mcp.json` (optional), `settings.json`, `redact.json`, `argv.json`, `inventory.pseudo.json`. The last file holds the groups, the records, and the free-text lines in `text`. |
 | `out/` | The only writable directory of the container. ais reads the result from standard output, not from here. |
+| `out/usage.json` | CPU time and peak memory of the container: `cpu_usec`, `user_usec`, `system_usec`, and `mem_peak`. The entrypoint writes it after `claude` exits. A missing counter is 0. |
+| `prefilter/` | Feed runs with a prefilter only. `in.json` is the input of the scoring container. `out.json` and `err.log` are its standard output and standard error. |
 | `stdout.json` | Standard output of the container. |
 | `stderr.log` | Standard error of the container. |
 | `result.json` | Result in the pseudonymized form. |
@@ -1196,13 +1319,15 @@ The NATS sink sets a message ID of the form `<run-id>/<kind>/<sink>`. JetStream 
 
 Once an hour, the daemon deletes finished runs of each task. It deletes the runs beyond `retention.keepRuns` and the runs older than `retention.keepDays`.
 It removes the database rows and the run directories. Runs that are `queued` or `running` stay.
-The same job deletes feed items in the state `seen` that are older than `retention.keepDays`. If `retention.keepDays` is `0`, it keeps them.
+The same job deletes feed items in the state `seen` or `filtered` that are older than `retention.keepDays`. If `retention.keepDays` is `0`, it keeps them.
 
 ### Image
 
 `ais image build` writes the recipe from the binary into a temporary directory and builds the image. The build tags the image with a hash of the recipe.
 If the hash does not match the binary, the image is stale. `ais run` and `ais daemon` build it again if `image.autobuild` is `true`.
 After the build, ais runs `claude --help` in the image. It fails if the help text does not show a flag that ais uses.
+
+The prefilter has its own image. `ais prefilter build` builds it. `ais image build` does not. Its recipe hash covers the files of the recipe and the keys `image.prefilter.*`. See Prefilter.
 
 ## Files
 

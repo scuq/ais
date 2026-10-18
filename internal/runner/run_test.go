@@ -3,6 +3,8 @@ package runner
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -443,5 +445,182 @@ func TestFeedRunCapHoldsBackScheduledRuns(t *testing.T) {
 	_ = r.Store.InsertRun(context.Background(), store.Run{ID: "legacy", Task: tk.Name, State: store.StateSucceeded, Trigger: scheduler.TriggerSchedule, StartedAt: time.Now()})
 	if n, _ := r.Store.ModelRunsSince(context.Background(), tk.Name, scheduler.TriggerSchedule, "feed", time.Now().Add(-24*time.Hour)); n != 1 {
 		t.Errorf("legacy run counted: %d", n)
+	}
+}
+
+// prefilterFixture adds a prefilter to the feed fixture and answers the
+// scoring container with scores: the "Other" item scores low, the PAN-OS
+// item is a keyword hit and never reaches the model.
+func prefilterFixture(t *testing.T, mode string) (*Runner, *runtime.Fake, *task.Task) {
+	t.Helper()
+	r, fake, tk, _ := feedFixture(t, rssTwo)
+	tk.Feeds.Prefilter = &task.Prefilter{Mode: mode, Threshold: 0.45, Image: "localhost/ais-prefilter:test", Timeout: 5 * time.Second, MaxTokens: 128}
+	fake.Stdout = okEnvelope
+	fake.OnRun = func(argv []string) (string, int, bool) {
+		for _, a := range argv {
+			if a == "localhost/ais-prefilter:test" {
+				return `{"v":1,"model":"test-model","dim":4,"ms":2,"scores":[{"key":"` + keyOf("b") + `","score":0.11,"best":"g0"}]}`, 0, true
+			}
+		}
+		return "", 0, false
+	}
+	return r, fake, tk
+}
+
+// keyOf mirrors feed.Item.Key for a GUID.
+func keyOf(guid string) string {
+	sum := sha256.Sum256([]byte(guid))
+	return hex.EncodeToString(sum[:8])
+}
+
+func TestPrefilterShadowHandsEverythingAndRecords(t *testing.T) {
+	r, fake, tk := prefilterFixture(t, task.PrefilterShadow)
+	out, err := r.Run(context.Background(), tk, scheduler.TriggerSchedule)
+	if err != nil || out.Run.State != store.StateSucceeded {
+		t.Fatalf("%+v %v", out.Run, err)
+	}
+	if n := len(fake.CallsMatching("run")); n != 2 {
+		t.Errorf("want the prefilter container and the claude container, got %d run calls: %v", n, fake.Calls)
+	}
+	items, _ := r.Store.FeedItemsOf(context.Background(), out.Run.ID)
+	if len(items) != 2 {
+		t.Fatalf("shadow must hand every item: %+v", items)
+	}
+	for _, it := range items {
+		switch it.Title {
+		case "PAN-OS flaw":
+			if it.Decision != store.DecisionKeep || it.Reason != "keyword:pan os" || !strings.Contains(it.Match, "PAN-OS") {
+				t.Errorf("keyword item: %+v", it)
+			}
+		case "Other":
+			if it.Decision != store.DecisionDrop || it.Reason != "model" || it.Score != 0.11 || it.Model != "test-model" || it.State != store.FeedSeen {
+				t.Errorf("dropped-in-shadow item: %+v", it)
+			}
+		}
+	}
+	pl, _ := r.Store.GetPrompt(context.Background(), out.Run.ID)
+	if !strings.Contains(pl.Prompt, "PAN-OS flaw — https://example.test/a [matches Palo Alto Networks PAN-OS") || !strings.Contains(pl.Prompt, "- T: Other — https://example.test/b\n") {
+		t.Errorf("prompt marks the match and still lists the other item:\n%s", pl.Prompt)
+	}
+	// The work directory keeps the model's input and output.
+	if _, err := os.Stat(filepath.Join(out.Dir, "prefilter", "out.json")); err != nil {
+		t.Error("prefilter/out.json missing")
+	}
+}
+
+func TestPrefilterEnforceWithholdsAndGoesQuiet(t *testing.T) {
+	r, fake, tk := prefilterFixture(t, task.PrefilterEnforce)
+	out, err := r.Run(context.Background(), tk, scheduler.TriggerSchedule)
+	if err != nil || out.Run.State != store.StateSucceeded {
+		t.Fatalf("%+v %v", out.Run, err)
+	}
+	items, _ := r.Store.FeedItemsOf(context.Background(), out.Run.ID)
+	if len(items) != 1 || items[0].Title != "PAN-OS flaw" {
+		t.Fatalf("enforce hands only the kept item: %+v", items)
+	}
+	states, _ := r.Store.FeedItemStates(context.Background(), tk.Name, []string{keyOf("b")})
+	if states[keyOf("b")].State != store.FeedFiltered {
+		t.Errorf("dropped item: %+v", states[keyOf("b")])
+	}
+	pl, _ := r.Store.GetPrompt(context.Background(), out.Run.ID)
+	if strings.Contains(pl.Prompt, "Other") {
+		t.Error("the withheld item reached the prompt")
+	}
+	// A new low-scoring item alone: quiet, no claude container, the
+	// filtered count in the row.
+	fake.OnRun = func(argv []string) (string, int, bool) {
+		for _, a := range argv {
+			if a == "localhost/ais-prefilter:test" {
+				return `{"v":1,"model":"test-model","dim":4,"ms":2,"scores":[{"key":"` + keyOf("c") + `","score":0.2,"best":"g0"}]}`, 0, true
+			}
+		}
+		return "", 0, false
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`<rss version="2.0"><channel><title>T</title><item><title>Other</title><link>https://example.test/b</link><guid>b</guid></item><item><title>Cooking</title><link>https://example.test/c</link><guid>c</guid></item></channel></rss>`))
+	}))
+	defer srv.Close()
+	tk.Feeds.URLs = []string{srv.URL + "/rss"}
+	calls := len(fake.Calls)
+	out, err = r.Run(context.Background(), tk, scheduler.TriggerSchedule)
+	if err != nil || out.Run.State != store.StateSkipped || out.Run.Reason != ReasonQuiet || !strings.Contains(out.Run.Error, "1 filtered by the prefilter") {
+		t.Fatalf("quiet with filtered: %+v %v", out.Run, err)
+	}
+	if n := len(fake.Calls) - calls; n != 1 {
+		t.Errorf("only the prefilter container may run on a quiet tick, got %d calls: %v", n, fake.Calls[calls:])
+	}
+}
+
+func TestPrefilterErrorKeepsEverything(t *testing.T) {
+	r, fake, tk := prefilterFixture(t, task.PrefilterEnforce)
+	fake.OnRun = func(argv []string) (string, int, bool) {
+		for _, a := range argv {
+			if a == "localhost/ais-prefilter:test" {
+				return "", 125, true // image missing
+			}
+		}
+		return "", 0, false
+	}
+	out, err := r.Run(context.Background(), tk, scheduler.TriggerSchedule)
+	if err != nil || out.Run.State != store.StateSucceeded {
+		t.Fatalf("%+v %v", out.Run, err)
+	}
+	items, _ := r.Store.FeedItemsOf(context.Background(), out.Run.ID)
+	if len(items) != 2 {
+		t.Fatalf("an error must keep every item: %+v", items)
+	}
+	for _, it := range items {
+		if it.Title == "Other" && (it.Decision != store.DecisionKeep || it.Reason != "error") {
+			t.Errorf("error item: %+v", it)
+		}
+	}
+}
+
+func TestPrefilterOffRunsNoContainer(t *testing.T) {
+	r, fake, tk := prefilterFixture(t, task.PrefilterOff)
+	out, err := r.Run(context.Background(), tk, scheduler.TriggerSchedule)
+	if err != nil || out.Run.State != store.StateSucceeded {
+		t.Fatalf("%+v %v", out.Run, err)
+	}
+	if n := len(fake.CallsMatching("run")); n != 1 {
+		t.Errorf("off must not start the prefilter: %v", fake.Calls)
+	}
+	items, _ := r.Store.FeedItemsOf(context.Background(), out.Run.ID)
+	if len(items) != 2 || items[0].Decision != "" {
+		t.Errorf("%+v", items)
+	}
+}
+
+// TestRunRecordsUsage checks the columns of a feed run: what the tick
+// fetched, what the prefilter did, and the usage that the run container's
+// entrypoint wrote to out/usage.json.
+func TestRunRecordsUsage(t *testing.T) {
+	r, fake, tk := prefilterFixture(t, task.PrefilterShadow)
+	prefilterOut := `{"v":1,"model":"test-model","dim":4,"ms":2,"scores":[{"key":"` + keyOf("b") + `","score":0.11,"best":"g0"}],"usage":{"cpu_usec":5400000,"mem_peak":838860800}}`
+	fake.OnRun = func(argv []string) (string, int, bool) {
+		for i, a := range argv {
+			if a == "localhost/ais-prefilter:test" {
+				return prefilterOut, 0, true
+			}
+			if a == "--volume" && strings.HasSuffix(argv[i+1], ":/run/ais/out") {
+				out := strings.TrimSuffix(argv[i+1], ":/run/ais/out")
+				_ = os.WriteFile(filepath.Join(out, "usage.json"), []byte(`{"cpu_usec":3100000,"user_usec":3000000,"system_usec":100000,"mem_peak":314572800}`), 0o600)
+			}
+		}
+		return "", 0, false
+	}
+	out, err := r.Run(context.Background(), tk, scheduler.TriggerSchedule)
+	if err != nil || out.Run.State != store.StateSucceeded {
+		t.Fatalf("%+v %v", out.Run, err)
+	}
+	got, _ := r.Store.GetRun(context.Background(), out.Run.ID)
+	if got.Feeds != 1 || got.FeedItems != 2 || got.FeedNew != 2 || got.FeedFiltered != 0 || got.FetchMS < 0 {
+		t.Errorf("feed columns: %+v", got)
+	}
+	if got.PrefilterKeyword != 1 || got.PrefilterScored != 1 || got.PrefilterKept != 1 || got.PrefilterDropped != 1 || got.PrefilterCPUMS != 5400 || got.PrefilterMemPeak != 838860800 || got.PrefilterMS < 0 {
+		t.Errorf("prefilter columns: %+v", got)
+	}
+	if got.CPUMS != 3100 || got.MemPeak != 314572800 {
+		t.Errorf("model container usage: %+v", got)
 	}
 }

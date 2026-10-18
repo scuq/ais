@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"syscall"
+	"time"
 
 	"github.com/scuq/ais/internal/backend"
 	"github.com/scuq/ais/internal/config"
@@ -143,6 +144,11 @@ func dryRunTask(ctx context.Context, p *output.Printer, cfg *config.Config, t *t
 			defer st.Close()
 			opts.Feeds = st
 		}
+		if t.Feeds.Prefilter.Enabled() {
+			if rt, err := runtime.Detect(cfg.Runtime.Engine); err == nil {
+				opts.Prefilter = rt
+			}
+		}
 	}
 	prep, err := runner.Prepare(ctx, cfg, t, runner.EphemeralSalt{}, opts)
 	for _, f := range prep.Feeds {
@@ -151,6 +157,9 @@ func dryRunTask(ctx context.Context, p *output.Printer, cfg *config.Config, t *t
 		} else {
 			p.Info("feed %s: %d item(s)", f.URL, f.Items)
 		}
+	}
+	if prep != nil {
+		printPrefilter(p, t, prep)
 	}
 	if errors.Is(err, runner.ErrQuiet) {
 		p.Info("feed check: no new item; the daemon would record a quiet run and start no container")
@@ -167,7 +176,7 @@ func dryRunTask(ctx context.Context, p *output.Printer, cfg *config.Config, t *t
 	if prep.Mode == "feed" {
 		p.Info("feed check: %d new item(s) go to the model", len(prep.Feed))
 		for _, it := range prep.Feed {
-			fmt.Fprintf(os.Stdout, "#   %s: %s — %s\n", it.Source, it.Title, it.Link)
+			fmt.Fprintf(os.Stdout, "#   %s%s: %s — %s\n", decisionTag(it.Keep, it.Score, it.Match), it.Source, it.Title, it.Link)
 		}
 	}
 	pl := prep.PromptLog()
@@ -190,6 +199,41 @@ func dryRunTask(ctx context.Context, p *output.Printer, cfg *config.Config, t *t
 	}
 	fmt.Fprintf(os.Stdout, "# pseudonyms minted: %d (map stays on the host)\n", len(prep.Map.Tokens))
 	return 0
+}
+
+// printPrefilter reports what the prefilter did in a dry run.
+func printPrefilter(p *output.Printer, t *task.Task, prep *runner.Prepared) {
+	if t.Feeds == nil || !t.Feeds.Prefilter.Enabled() || prep.Mode != "feed" {
+		return
+	}
+	pf := prep.Prefilter
+	if pf.Kept+pf.Dropped > 0 {
+		p.Info("prefilter (%s, threshold %.2f): %d keyword hit(s), %d scored by %s in %s; %d kept, %d dropped", t.Feeds.Prefilter.Mode, t.Feeds.Prefilter.Threshold, pf.Keyword, pf.Scored, pf.Model, pf.Duration.Round(time.Millisecond), pf.Kept, pf.Dropped)
+	}
+	if pf.Err != "" {
+		p.Warn("prefilter: %s; every undecided item was kept", pf.Err)
+	}
+	if len(prep.Filtered) > 0 {
+		p.Info("prefilter withheld %d item(s) from the model:", len(prep.Filtered))
+		for _, it := range prep.Filtered {
+			fmt.Fprintf(os.Stdout, "#   [drop %.2f] %s: %s — %s\n", it.Score, it.Source, it.Title, it.Link)
+		}
+	}
+}
+
+// decisionTag renders "[keep 0.71 Palo Alto Networks PAN-OS 11.2] ".
+func decisionTag(keep string, score float64, match string) string {
+	if keep == "" {
+		return ""
+	}
+	s := "[" + keep
+	if score > 0 {
+		s += fmt.Sprintf(" %.2f", score)
+	}
+	if match != "" {
+		s += " " + match
+	}
+	return s + "] "
 }
 
 // ensureImage builds the run image when missing or stale (and allowed).

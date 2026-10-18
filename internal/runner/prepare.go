@@ -20,6 +20,7 @@ import (
 	"github.com/scuq/ais/internal/egress"
 	"github.com/scuq/ais/internal/feed"
 	"github.com/scuq/ais/internal/inventory"
+	"github.com/scuq/ais/internal/prefilter"
 	"github.com/scuq/ais/internal/prompt"
 	"github.com/scuq/ais/internal/pseudo"
 	"github.com/scuq/ais/internal/scheduler"
@@ -74,6 +75,12 @@ type Options struct {
 	// Peek makes a feed check report the new items without claiming them
 	// (dry runs).
 	Peek bool
+	// Prefilter runs the scoring container of a feed check; nil keeps every
+	// item (the prefilter then reports an error, never a drop).
+	Prefilter prefilter.Runner
+	// Rescore scores new items again even when a tick already decided
+	// them (ais prefilter test --rescore).
+	Rescore bool
 	// SELinux adds the relabel option to bind mounts.
 	SELinux bool
 	// Live receives a rendered event stream while the container runs; nil
@@ -101,6 +108,34 @@ type Prepared struct {
 	Mode  string
 	Feed  []feed.Item
 	Feeds []FeedStatus
+	// Prefilter is what the host-side filter did with this tick's items;
+	// Filtered lists the items it withheld (enforce mode only).
+	Prefilter prefilter.Info
+	Filtered  []feed.Item
+	// FetchTime is the wall time of reading the feeds.
+	FetchTime time.Duration
+}
+
+// UsageColumns copies what the feed tick fetched and what the prefilter
+// did into the columns of a run row.
+func (p *Prepared) UsageColumns(r *store.Run) {
+	if p == nil || p.Mode != "feed" {
+		return
+	}
+	distinct := 0
+	for _, f := range p.Feeds {
+		r.Feeds++
+		if f.Err != "" {
+			r.FeedsFailed++
+		}
+		distinct += f.Items
+	}
+	r.FeedItems = distinct
+	r.FeedNew, r.FeedFiltered, r.FetchMS = len(p.Feed), len(p.Filtered), p.FetchTime.Milliseconds()
+	pf := p.Prefilter
+	r.PrefilterMS, r.PrefilterScored, r.PrefilterKeyword = pf.Duration.Milliseconds(), pf.Scored, pf.Keyword
+	r.PrefilterKept, r.PrefilterDropped = pf.Kept, pf.Dropped
+	r.PrefilterCPUMS, r.PrefilterMemPeak, r.PrefilterError = pf.CPU.Milliseconds(), pf.MemPeak, pf.Err
 }
 
 // FeedStore is the part of the store that remembers feed items.
@@ -108,6 +143,8 @@ type FeedStore interface {
 	ClaimFeedItems(ctx context.Context, task, runID string, items []store.FeedItem, limit int, now time.Time) ([]store.FeedItem, error)
 	RecordFeedItemsSeen(ctx context.Context, task string, items []store.FeedItem, now time.Time) error
 	ModelRunsSince(ctx context.Context, task, trigger, mode string, since time.Time) (int, error)
+	// FeedItemStates returns the rows the task already has for keys.
+	FeedItemStates(ctx context.Context, task string, keys []string) (map[string]store.FeedItem, error)
 }
 
 // FeedStatus is what one feed returned for a run, for logs and dry runs.
@@ -174,36 +211,6 @@ func Prepare(ctx context.Context, cfg *config.Config, t *task.Task, salts SaltSo
 		}
 	}
 
-	mode := "full"
-	var feedItems []feed.Item
-	var feedStatus []FeedStatus
-	if t.Feeds != nil && !scheduler.FullRun(opts.Trigger) {
-		mode = "feed"
-		var err error
-		if feedItems, feedStatus, err = readFeeds(ctx, t, runID, now, opts); err != nil {
-			return nil, err
-		}
-		if len(feedItems) == 0 && t.Feeds.Quiet() {
-			_ = os.RemoveAll(runDir)
-			return &Prepared{Task: t, RunID: runID, StartedAt: now, Mode: mode, Feeds: feedStatus}, ErrQuiet
-		}
-		if cap := t.Feeds.RunCap(); cap > 0 && opts.Feeds != nil && !opts.Peek && opts.Trigger == scheduler.TriggerSchedule {
-			n, err := opts.Feeds.ModelRunsSince(ctx, t.Name, scheduler.TriggerSchedule, mode, now.Add(-24*time.Hour))
-			if err != nil {
-				return nil, err
-			}
-			if n >= cap {
-				_ = os.RemoveAll(runDir)
-				if rel, ok := opts.Feeds.(interface {
-					SettleFeedItems(context.Context, string, bool) error
-				}); ok {
-					_ = rel.SettleFeedItems(ctx, runID, false) // the items wait for a later tick
-				}
-				return &Prepared{Task: t, RunID: runID, StartedAt: now, Mode: mode, Feed: feedItems, Feeds: feedStatus}, fmt.Errorf("%w: %d scheduled feed run(s) started the model in the last 24 h; %d new item(s) wait", ErrRateLimited, n, len(feedItems))
-			}
-		}
-	}
-
 	saltID, salt, err := salts.TaskSalt(ctx, t.Name)
 	if err != nil {
 		return nil, fmt.Errorf("salt: %w", err)
@@ -234,6 +241,39 @@ func Prepare(ctx context.Context, cfg *config.Config, t *task.Task, salts SaltSo
 	var groups []inventory.Group
 	if len(t.Expose.Prompt.GroupBy) > 0 {
 		groups = inventory.Minimize(pseudoRecs, t.Expose.Prompt.GroupBy, t.Expose.Prompt.Collect)
+	}
+
+	mode := "full"
+	var feedItems, filtered []feed.Item
+	var feedStatus []FeedStatus
+	var pfInfo prefilter.Info
+	var fetchTime time.Duration
+	if t.Feeds != nil && !scheduler.FullRun(opts.Trigger) {
+		mode = "feed"
+		fr, err := readFeeds(ctx, t, runID, now, opts, runDir, prefilter.BuildTargets(groups, pseudoText))
+		if err != nil {
+			return nil, err
+		}
+		feedItems, feedStatus, pfInfo, filtered, fetchTime = fr.Items, fr.Status, fr.Prefilter, fr.Filtered, fr.FetchTime
+		if len(feedItems) == 0 && t.Feeds.Quiet() {
+			_ = os.RemoveAll(runDir)
+			return &Prepared{Task: t, RunID: runID, StartedAt: now, Mode: mode, Feeds: feedStatus, Prefilter: pfInfo, Filtered: filtered, FetchTime: fetchTime}, ErrQuiet
+		}
+		if cap := t.Feeds.RunCap(); cap > 0 && opts.Feeds != nil && !opts.Peek && opts.Trigger == scheduler.TriggerSchedule {
+			n, err := opts.Feeds.ModelRunsSince(ctx, t.Name, scheduler.TriggerSchedule, mode, now.Add(-24*time.Hour))
+			if err != nil {
+				return nil, err
+			}
+			if n >= cap {
+				_ = os.RemoveAll(runDir)
+				if rel, ok := opts.Feeds.(interface {
+					SettleFeedItems(context.Context, string, bool) error
+				}); ok {
+					_ = rel.SettleFeedItems(ctx, runID, false) // the items wait for a later tick
+				}
+				return &Prepared{Task: t, RunID: runID, StartedAt: now, Mode: mode, Feed: feedItems, Feeds: feedStatus, Prefilter: pfInfo, Filtered: filtered, FetchTime: fetchTime}, fmt.Errorf("%w: %d scheduled feed run(s) started the model in the last 24 h; %d new item(s) wait", ErrRateLimited, n, len(feedItems))
+			}
+		}
 	}
 
 	// The hook's cgnat key is random per run: addresses it rewrites in web
@@ -332,14 +372,32 @@ func Prepare(ctx context.Context, cfg *config.Config, t *task.Task, salts SaltSo
 		Mode:       mode,
 		Feed:       feedItems,
 		Feeds:      feedStatus,
+		Prefilter:  pfInfo,
+		Filtered:   filtered,
+		FetchTime:  fetchTime,
 	}, nil
+}
+
+// feedRead is what readFeeds returns.
+type feedRead struct {
+	Items     []feed.Item
+	Status    []FeedStatus
+	Prefilter prefilter.Info
+	Filtered  []feed.Item
+	FetchTime time.Duration
 }
 
 // readFeeds fetches the task's feeds and returns the items that no earlier
 // run evaluated, newest first and capped at feeds.maxItems. A feed that
 // fails is reported in the status and skipped; the others still count.
-func readFeeds(ctx context.Context, t *task.Task, runID string, now time.Time, opts Options) ([]feed.Item, []FeedStatus, error) {
+// With a prefilter, every item that no tick has scored is scored against
+// targets first; in enforce mode a dropped item is recorded as filtered
+// and not returned.
+func readFeeds(ctx context.Context, t *task.Task, runID string, now time.Time, opts Options, runDir string, targets []prefilter.Target) (feedRead, error) {
+	var fr feedRead
+	fetchStart := time.Now()
 	results := feed.FetchAll(ctx, t.Feeds.URLs, t.Feeds.Timeout)
+	fr.FetchTime = time.Since(fetchStart)
 	var status []FeedStatus
 	var all []store.FeedItem
 	byKey := map[string]feed.Item{}
@@ -356,11 +414,12 @@ func readFeeds(ctx context.Context, t *task.Task, runID string, now time.Time, o
 				continue
 			}
 			byKey[it.Key] = it
-			all = append(all, store.FeedItem{Key: it.Key, Title: it.Title, Link: it.Link, Source: it.Source, Published: it.Published})
+			all = append(all, store.FeedItem{Key: it.Key, Title: it.Title, Link: it.Link, Source: it.Source, Summary: it.Summary, Published: it.Published})
 		}
 	}
+	fr.Status = status
 	if failed == len(results) {
-		return nil, status, fmt.Errorf("feeds: every feed failed (%s)", status[0].Err)
+		return fr, fmt.Errorf("feeds: every feed failed (%s)", status[0].Err)
 	}
 	// Old items are news to nobody: a feed that rotates its entries must
 	// not present them as new.
@@ -375,13 +434,24 @@ func readFeeds(ctx context.Context, t *task.Task, runID string, now time.Time, o
 	}
 	if opts.Feeds != nil && len(old) > 0 && !opts.Peek {
 		if err := opts.Feeds.RecordFeedItemsSeen(ctx, t.Name, old, now); err != nil {
-			return nil, status, fmt.Errorf("feeds: %w", err)
+			return fr, fmt.Errorf("feeds: %w", err)
 		}
 	}
 	all = recent
+	if t.Feeds.Prefilter.Enabled() {
+		info, err := scoreFeedItems(ctx, t, runID, opts, runDir, targets, all)
+		if err != nil {
+			return fr, err
+		}
+		fr.Prefilter = info
+	}
 	var fresh []store.FeedItem
 	if opts.Feeds == nil {
-		fresh = all
+		for _, it := range all {
+			if it.State != store.FeedFiltered {
+				fresh = append(fresh, it)
+			}
+		}
 		if len(fresh) > t.Feeds.MaxItems {
 			fresh = fresh[:t.Feeds.MaxItems]
 		}
@@ -392,7 +462,7 @@ func readFeeds(ctx context.Context, t *task.Task, runID string, now time.Time, o
 		}
 		var err error
 		if fresh, err = opts.Feeds.ClaimFeedItems(ctx, t.Name, claimAs, all, t.Feeds.MaxItems, now); err != nil {
-			return nil, status, fmt.Errorf("feeds: %w", err)
+			return fr, fmt.Errorf("feeds: %w", err)
 		}
 	}
 	freshKeys := map[string]bool{}
@@ -409,16 +479,77 @@ func readFeeds(ctx context.Context, t *task.Task, runID string, now time.Time, o
 			status[i].Unstable = true
 		}
 	}
-	out := make([]feed.Item, 0, len(fresh))
-	for _, f := range fresh {
+	toItem := func(f store.FeedItem) feed.Item {
 		it, ok := byKey[f.Key]
 		if !ok {
 			// An item from an earlier failed run that the feed no longer lists.
-			it = feed.Item{Key: f.Key, Title: f.Title, Link: f.Link, Source: f.Source, Published: f.Published}
+			it = feed.Item{Key: f.Key, Title: f.Title, Link: f.Link, Source: f.Source, Summary: f.Summary, Published: f.Published}
 		}
-		out = append(out, it)
+		it.Score, it.Keep, it.Reason = f.Score, f.Decision, f.Reason
+		if f.Decision == store.DecisionKeep {
+			// A dropped item (shadow mode) still goes to the model, but
+			// must not be presented as a match.
+			it.Match = f.Match
+		}
+		return it
 	}
-	return out, status, nil
+	fr.Items = make([]feed.Item, 0, len(fresh))
+	for _, f := range fresh {
+		fr.Items = append(fr.Items, toItem(f))
+	}
+	for _, f := range all {
+		if f.State == store.FeedFiltered {
+			fr.Filtered = append(fr.Filtered, toItem(f))
+		}
+	}
+	return fr, nil
+}
+
+// scoreFeedItems runs the prefilter over the items of all that no run has
+// evaluated and no tick has scored, and writes the decisions into all. In
+// enforce mode a dropped item gets the state filtered.
+func scoreFeedItems(ctx context.Context, t *task.Task, runID string, opts Options, runDir string, targets []prefilter.Target, all []store.FeedItem) (prefilter.Info, error) {
+	pf := t.Feeds.Prefilter
+	known := map[string]store.FeedItem{}
+	if opts.Feeds != nil {
+		keys := make([]string, len(all))
+		for i, it := range all {
+			keys[i] = it.Key
+		}
+		var err error
+		if known, err = opts.Feeds.FeedItemStates(ctx, t.Name, keys); err != nil {
+			return prefilter.Info{}, fmt.Errorf("feeds: %w", err)
+		}
+	}
+	idx := map[string]int{}
+	var toScore []prefilter.Item
+	for i, it := range all {
+		idx[it.Key] = i
+		if k, ok := known[it.Key]; ok && (k.State != store.FeedNew || (k.Decision != "" && !opts.Rescore)) {
+			continue
+		}
+		toScore = append(toScore, prefilter.Item{Key: it.Key, Text: prefilter.ItemText(it.Title, it.Summary)})
+	}
+	if len(toScore) == 0 {
+		return prefilter.Info{}, nil
+	}
+	dialect, err := container.DialectFor(opts.Engine)
+	if err != nil {
+		dialect = container.DockerDialect{}
+	}
+	cfg := prefilter.Config{Filter: pf, TaskName: t.Name, RunID: runID, Dialect: dialect, UID: opts.UID, GID: opts.GID, SELinux: opts.SELinux}
+	decisions, info := prefilter.Score(ctx, opts.Prefilter, cfg, filepath.Join(runDir, "prefilter"), targets, toScore)
+	for _, d := range decisions {
+		it := &all[idx[d.Key]]
+		it.Decision, it.Reason, it.Match, it.Score, it.Scored, it.Model = store.DecisionKeep, d.Reason, d.Match, d.Score, d.Scored, info.Model
+		if !d.Keep {
+			it.Decision = store.DecisionDrop
+			if pf.Enforces() {
+				it.State = store.FeedFiltered
+			}
+		}
+	}
+	return info, nil
 }
 
 // inventorySources resolves the record source and the free-text file: a
